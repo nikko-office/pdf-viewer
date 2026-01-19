@@ -128,12 +128,15 @@ impl FileExplorer {
         // ドライブ選択 (Windows)
         #[cfg(windows)]
         {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("ドライブ:");
-                for drive in &['C', 'D', 'E', 'F'] {
+                // A-Zの全ドライブをチェック
+                for c in b'A'..=b'Z' {
+                    let drive = c as char;
                     let drive_path = format!("{}:\\", drive);
                     if Path::new(&drive_path).exists() {
-                        if ui.small_button(&drive_path).clicked() {
+                        let is_current = self.current_dir.starts_with(&drive_path);
+                        if ui.selectable_label(is_current, format!("{}:", drive)).clicked() {
                             self.current_dir = PathBuf::from(&drive_path);
                             self.refresh();
                         }
