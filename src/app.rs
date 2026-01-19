@@ -46,6 +46,9 @@ pub struct PdfViewerApp {
     // コンテキストメニュー
     context_menu_pdf: Option<(usize, egui::Pos2)>,
 
+    // ドラッグ中のPDFパス
+    dragging_pdf: Option<PathBuf>,
+
     // ステータスメッセージ
     status_message: String,
 }
@@ -99,6 +102,7 @@ impl PdfViewerApp {
             custom_stamps: Vec::new(),
             custom_stamp_textures: Vec::new(),
             context_menu_pdf: None,
+            dragging_pdf: None,
             status_message: "準備完了".to_string(),
         }
     }
@@ -812,6 +816,15 @@ impl eframe::App for PdfViewerApp {
                 let mut clicked_pdf: Option<(usize, PathBuf)> = None;
                 let mut right_clicked_pdf: Option<(usize, egui::Pos2)> = None;
                 let mut thumbnails_to_load: Vec<(usize, PathBuf)> = Vec::new();
+                let mut drag_started_pdf: Option<PathBuf> = None;
+                let mut drag_ended = false;
+
+                // ドラッグ中のヒント表示
+                if self.dragging_pdf.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::YELLOW, "📂 左のフォルダツリーにドロップして移動");
+                    });
+                }
 
                 egui::ScrollArea::both()
                     .auto_shrink([false; 2])
@@ -828,15 +841,21 @@ impl eframe::App for PdfViewerApp {
                             .spacing([spacing, spacing])
                             .show(ui, |ui| {
                                 for (idx, path, name, is_selected, tex_id) in &folder_pdfs {
+                                    let is_dragging = self.dragging_pdf.as_ref() == Some(path);
+                                    
                                     let frame_response = egui::Frame::none()
-                                        .fill(if *is_selected {
+                                        .fill(if is_dragging {
+                                            Color32::from_rgba_unmultiplied(100, 150, 200, 100)
+                                        } else if *is_selected {
                                             Color32::from_rgb(70, 130, 180)
                                         } else {
                                             Color32::from_gray(45)
                                         })
                                         .stroke(egui::Stroke::new(
                                             if *is_selected { 3.0 } else { 1.0 },
-                                            if *is_selected {
+                                            if is_dragging {
+                                                Color32::YELLOW
+                                            } else if *is_selected {
                                                 Color32::from_rgb(100, 149, 237)
                                             } else {
                                                 Color32::from_gray(60)
@@ -851,7 +870,7 @@ impl eframe::App for PdfViewerApp {
                                             ui.vertical_centered(|ui| {
                                                 let (rect, response) = ui.allocate_exact_size(
                                                     Vec2::new(thumb_width - 16.0, thumb_height - 50.0),
-                                                    egui::Sense::click(),
+                                                    egui::Sense::click_and_drag(),
                                                 );
 
                                                 if let Some(texture_id) = tex_id {
@@ -874,6 +893,21 @@ impl eframe::App for PdfViewerApp {
                                                         Color32::from_gray(120),
                                                     );
                                                     thumbnails_to_load.push((*idx, path.clone()));
+                                                }
+
+                                                // ドラッグ開始
+                                                if response.drag_started() {
+                                                    drag_started_pdf = Some(path.clone());
+                                                }
+                                                
+                                                // ドラッグ中
+                                                if response.dragged() {
+                                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                                }
+                                                
+                                                // ドラッグ終了
+                                                if response.drag_stopped() {
+                                                    drag_ended = true;
                                                 }
 
                                                 if response.clicked() {
@@ -907,6 +941,41 @@ impl eframe::App for PdfViewerApp {
                                 }
                             });
                     });
+                
+                // ドラッグ状態の更新
+                if let Some(path) = drag_started_pdf {
+                    self.dragging_pdf = Some(path);
+                }
+                
+                // ドラッグ終了時にフォルダにドロップ
+                if drag_ended {
+                    if let Some(source_path) = self.dragging_pdf.take() {
+                        if let Some(target_folder) = self.file_explorer.get_drop_target().cloned() {
+                            let file_name = source_path.file_name().unwrap_or_default();
+                            let dest_path = target_folder.join(file_name);
+                            
+                            if source_path != dest_path {
+                                match std::fs::rename(&source_path, &dest_path) {
+                                    Ok(_) => {
+                                        self.status_message = format!(
+                                            "移動しました: {} → {}",
+                                            source_path.display(),
+                                            target_folder.display()
+                                        );
+                                        // フォルダ内PDFリストを更新
+                                        if let Some(ref folder) = self.current_folder.clone() {
+                                            self.update_folder_pdfs(folder);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.status_message = format!("移動に失敗しました: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.file_explorer.clear_drop_target();
+                }
 
                 for (idx, path) in thumbnails_to_load.into_iter().take(3) {
                     if let Ok(doc) = PdfDocument::open(&path) {
