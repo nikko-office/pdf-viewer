@@ -1,6 +1,6 @@
 //! アプリケーションの状態管理
 
-use crate::pdf::{PdfDocument, PdfOperations, Stamp, TextAnnotation};
+use crate::pdf::{PdfDocument, PdfOperations, RectAnnotation, Stamp, TextAnnotation};
 use crate::ui::{EditorPanel, FileExplorer};
 use eframe::egui::{self, Color32, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub struct PdfViewerApp {
     selected_page: usize,
     stamps: Vec<Stamp>,
     text_annotations: Vec<TextAnnotation>,
+    rect_annotations: Vec<RectAnnotation>,
     has_unsaved_changes: bool,
 
     // UI 状態
@@ -65,6 +66,10 @@ struct FolderPdfEntry {
 struct AnnotationData {
     stamps: Vec<Stamp>,
     texts: Vec<TextAnnotation>,
+    #[serde(default)]
+    rects: Vec<RectAnnotation>,  // 矩形注釈
+    #[serde(default)]
+    page_rotations: Vec<i32>,  // ページごとの回転角度
 }
 
 /// カスタムスタンプ（PNG透過対応）
@@ -88,6 +93,7 @@ impl PdfViewerApp {
             selected_page: 0,
             stamps: Vec::new(),
             text_annotations: Vec::new(),
+            rect_annotations: Vec::new(),
             has_unsaved_changes: false,
             show_split_dialog: false,
             show_stamp_panel: false,
@@ -157,7 +163,16 @@ impl PdfViewerApp {
                 if let Ok(data) = serde_json::from_str::<AnnotationData>(&content) {
                     self.stamps = data.stamps;
                     self.text_annotations = data.texts;
-                    self.status_message = format!("注釈を読み込みました");
+                    self.rect_annotations = data.rects;
+                    
+                    // ページ回転情報を復元
+                    if let Some(ref mut doc) = self.current_document {
+                        for (page_idx, &rotation) in data.page_rotations.iter().enumerate() {
+                            doc.set_page_rotation(page_idx, rotation);
+                        }
+                    }
+                    
+                    self.status_message = "注釈を読み込みました".to_string();
                 }
             }
         }
@@ -166,9 +181,21 @@ impl PdfViewerApp {
     /// 注釈を保存
     fn save_annotations(&self, pdf_path: &PathBuf) {
         let ann_path = Self::get_annotations_path(pdf_path);
+        
+        // ページ回転情報を収集
+        let page_rotations: Vec<i32> = if let Some(ref doc) = self.current_document {
+            (0..doc.page_count())
+                .map(|i| doc.get_page_rotation(i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        
         let data = AnnotationData {
             stamps: self.stamps.clone(),
             texts: self.text_annotations.clone(),
+            rects: self.rect_annotations.clone(),
+            page_rotations,
         };
         if let Ok(content) = serde_json::to_string_pretty(&data) {
             if let Err(e) = std::fs::write(&ann_path, content) {
@@ -707,10 +734,17 @@ impl eframe::App for PdfViewerApp {
                     // プレビュー
                     let mut new_stamp = None;
                     let mut new_text = None;
+                    let mut new_rect = None;
                     let mut delete_stamp = None;
                     let mut delete_text = None;
+                    let mut delete_rect = None;
                     let mut move_stamp = None;
                     let mut move_text = None;
+                    let mut move_rect = None;
+                    let mut resize_stamp = None;
+                    let mut resize_text = None;
+                    let mut resize_rect = None;
+                    let mut edit_text = None;
                     let mut delete_custom_stamp = None;
                     let mut register_stamp_clicked = false;
                     
@@ -724,16 +758,24 @@ impl eframe::App for PdfViewerApp {
                                     self.selected_page,
                                     &self.stamps,
                                     &self.text_annotations,
+                                    &self.rect_annotations,
                                     self.show_stamp_panel,
                                     self.show_text_panel,
                                     &custom_stamp_info,
                                 );
                                 new_stamp = editor_result.new_stamp;
                                 new_text = editor_result.new_text;
+                                new_rect = editor_result.new_rect;
                                 delete_stamp = editor_result.delete_stamp;
                                 delete_text = editor_result.delete_text;
+                                delete_rect = editor_result.delete_rect;
                                 move_stamp = editor_result.move_stamp;
                                 move_text = editor_result.move_text;
+                                move_rect = editor_result.move_rect;
+                                resize_stamp = editor_result.resize_stamp;
+                                resize_text = editor_result.resize_text;
+                                resize_rect = editor_result.resize_rect;
+                                edit_text = editor_result.edit_text;
                                 delete_custom_stamp = editor_result.delete_custom_stamp;
                                 register_stamp_clicked = editor_result.register_stamp_clicked;
                             }
@@ -751,6 +793,12 @@ impl eframe::App for PdfViewerApp {
                         self.has_unsaved_changes = true;
                         self.status_message = "テキストを追加しました".to_string();
                     }
+                    // 矩形追加
+                    if let Some(rect) = new_rect {
+                        self.rect_annotations.push(rect);
+                        self.has_unsaved_changes = true;
+                        self.status_message = "矩形を追加しました".to_string();
+                    }
                     // スタンプ削除
                     if let Some(idx) = delete_stamp {
                         if idx < self.stamps.len() {
@@ -767,6 +815,14 @@ impl eframe::App for PdfViewerApp {
                             self.status_message = "テキストを削除しました".to_string();
                         }
                     }
+                    // 矩形削除
+                    if let Some(idx) = delete_rect {
+                        if idx < self.rect_annotations.len() {
+                            self.rect_annotations.remove(idx);
+                            self.has_unsaved_changes = true;
+                            self.status_message = "矩形を削除しました".to_string();
+                        }
+                    }
                     // スタンプ移動
                     if let Some((idx, new_x, new_y)) = move_stamp {
                         if idx < self.stamps.len() {
@@ -781,6 +837,50 @@ impl eframe::App for PdfViewerApp {
                             self.text_annotations[idx].x = new_x;
                             self.text_annotations[idx].y = new_y;
                             self.has_unsaved_changes = true;
+                        }
+                    }
+                    // 矩形移動
+                    if let Some((idx, new_x, new_y)) = move_rect {
+                        if idx < self.rect_annotations.len() {
+                            self.rect_annotations[idx].x = new_x;
+                            self.rect_annotations[idx].y = new_y;
+                            self.has_unsaved_changes = true;
+                        }
+                    }
+                    // スタンプリサイズ
+                    if let Some((idx, new_w, new_h)) = resize_stamp {
+                        if idx < self.stamps.len() {
+                            self.stamps[idx].width = new_w;
+                            self.stamps[idx].height = new_h;
+                            self.has_unsaved_changes = true;
+                            self.status_message = format!("スタンプサイズ変更: {:.0}x{:.0}", new_w, new_h);
+                        }
+                    }
+                    // テキストリサイズ（フォントサイズ変更）
+                    if let Some((idx, new_font_size)) = resize_text {
+                        if idx < self.text_annotations.len() {
+                            self.text_annotations[idx].font_size = new_font_size;
+                            self.has_unsaved_changes = true;
+                            self.status_message = format!("フォントサイズ変更: {:.0}", new_font_size);
+                        }
+                    }
+                    // 矩形リサイズ
+                    if let Some((idx, new_w, new_h)) = resize_rect {
+                        if idx < self.rect_annotations.len() {
+                            self.rect_annotations[idx].width = new_w;
+                            self.rect_annotations[idx].height = new_h;
+                            self.has_unsaved_changes = true;
+                            self.status_message = format!("矩形サイズ変更: {:.0}x{:.0}", new_w, new_h);
+                        }
+                    }
+                    // テキスト編集
+                    if let Some((idx, new_text, font_type, transparent)) = edit_text {
+                        if idx < self.text_annotations.len() {
+                            self.text_annotations[idx].text = new_text;
+                            self.text_annotations[idx].font_type = font_type;
+                            self.text_annotations[idx].transparent = transparent;
+                            self.has_unsaved_changes = true;
+                            self.status_message = "テキストを編集しました".to_string();
                         }
                     }
                     // カスタムスタンプ削除
@@ -997,9 +1097,10 @@ impl eframe::App for PdfViewerApp {
                     self.file_explorer.clear_drop_target();
                 }
 
-                for (idx, path) in thumbnails_to_load.into_iter().take(3) {
+                // サムネイルは低解像度で高速に読み込み（1フレームにつき2件まで）
+                for (idx, path) in thumbnails_to_load.into_iter().take(2) {
                     if let Ok(doc) = PdfDocument::open(&path) {
-                        if let Some(image) = doc.render_page_thumbnail(0, 160, 200) {
+                        if let Some(image) = doc.render_page_thumbnail(0, 100, 120) {
                             let texture = ctx.load_texture(
                                 format!("folder_pdf_{}", idx),
                                 image,

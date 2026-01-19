@@ -92,6 +92,23 @@ impl Stamp {
     }
 }
 
+/// フォントタイプ
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum FontType {
+    #[default]
+    Gothic,   // ゴシック体
+    Mincho,   // 明朝体
+}
+
+impl FontType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FontType::Gothic => "ゴシック",
+            FontType::Mincho => "明朝",
+        }
+    }
+}
+
 /// PDFに追加するテキスト注釈
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextAnnotation {
@@ -105,17 +122,51 @@ pub struct TextAnnotation {
     pub text: String,
     /// フォントサイズ (ポイント)
     pub font_size: f32,
+    /// フォントタイプ
+    #[serde(default)]
+    pub font_type: FontType,
+    /// 背景透過（trueで透過）
+    #[serde(default = "default_transparent")]
+    pub transparent: bool,
+}
+
+fn default_transparent() -> bool {
+    true
 }
 
 impl TextAnnotation {
     /// 新しいテキスト注釈を作成
-    pub fn new(page: usize, x: f32, y: f32, text: String, font_size: f32) -> Self {
+    pub fn new(page: usize, x: f32, y: f32, text: String, font_size: f32, font_type: FontType, transparent: bool) -> Self {
         Self {
             page,
             x,
             y,
             text,
             font_size,
+            font_type,
+            transparent,
         }
     }
+}
+
+/// 矩形注釈（墨消し用など）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RectAnnotation {
+    /// ページ番号 (0-indexed)
+    pub page: usize,
+    /// X座標 (PDFポイント)
+    pub x: f32,
+    /// Y座標 (PDFポイント)
+    pub y: f32,
+    /// 幅 (PDFポイント)
+    pub width: f32,
+    /// 高さ (PDFポイント)
+    pub height: f32,
+    /// 塗りつぶし色 (RGBA)
+    #[serde(default = "default_rect_color")]
+    pub color: [u8; 4],
+}
+
+fn default_rect_color() -> [u8; 4] {
+    [255, 255, 255, 255]  // 白色、不透明
 }

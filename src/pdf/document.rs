@@ -103,6 +103,13 @@ impl PdfDocument {
         self.page_rotations.get(page_index).copied().unwrap_or(0)
     }
 
+    /// ページの回転角度を設定
+    pub fn set_page_rotation(&mut self, page_index: usize, degrees: i32) {
+        if page_index < self.page_rotations.len() {
+            self.page_rotations[page_index] = degrees % 360;
+        }
+    }
+
     /// ページをレンダリング（回転対応）
     pub fn render_page(
         &self,

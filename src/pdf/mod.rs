@@ -6,4 +6,4 @@ mod renderer;
 
 pub use document::PdfDocument;
 pub use operations::PdfOperations;
-pub use renderer::{CustomStampInfo, Stamp, StampType, TextAnnotation};
+pub use renderer::{CustomStampInfo, FontType, RectAnnotation, Stamp, StampType, TextAnnotation};
