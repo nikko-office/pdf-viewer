@@ -18,7 +18,7 @@ impl PdfOperations {
     /// ページを回転
     pub fn rotate_page(doc: &mut PdfDocument, page_index: usize, degrees: i32) -> Result<()> {
         log::info!("ページ {} を {}度回転", page_index, degrees);
-        doc.refresh_page_count();
+        doc.rotate_page(page_index, degrees)?;
         Ok(())
     }
 

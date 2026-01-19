@@ -1,10 +1,11 @@
 //! アプリケーションの状態管理
 
-use crate::pdf::{PdfDocument, PdfOperations, Stamp, TextAnnotation};
+use crate::pdf::{PdfDocument, PdfOperations, Stamp, StampType, TextAnnotation};
 use crate::ui::{EditorPanel, FileExplorer};
 use eframe::egui::{self, Color32, TextureHandle, Vec2};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::SystemTime;
 
 /// アプリケーション全体の状態
 pub struct PdfViewerApp {
@@ -14,12 +15,14 @@ pub struct PdfViewerApp {
 
     // PDF ドキュメント
     current_document: Option<PdfDocument>,
+    current_pdf_path: Option<PathBuf>,
     documents: Vec<PdfDocument>,
 
     // 編集状態
     selected_page: usize,
     stamps: Vec<Stamp>,
     text_annotations: Vec<TextAnnotation>,
+    has_unsaved_changes: bool,
 
     // UI 状態
     show_split_dialog: bool,
@@ -35,8 +38,9 @@ pub struct PdfViewerApp {
     pdf_thumbnails: Vec<Option<TextureHandle>>,
     current_folder: Option<PathBuf>,
 
-    // カスタムスタンプ
+    // カスタムスタンプ（PNG透過対応）
     custom_stamps: Vec<CustomStamp>,
+    custom_stamp_textures: Vec<Option<TextureHandle>>,
 
     // コンテキストメニュー
     context_menu_pdf: Option<(usize, egui::Pos2)>,
@@ -49,13 +53,17 @@ pub struct PdfViewerApp {
 struct FolderPdfEntry {
     path: PathBuf,
     name: String,
+    modified: SystemTime,
 }
 
-/// カスタムスタンプ
+/// カスタムスタンプ（PNG透過対応）
 #[derive(Clone)]
 pub struct CustomStamp {
     pub name: String,
     pub path: PathBuf,
+    pub image_data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl PdfViewerApp {
@@ -64,10 +72,12 @@ impl PdfViewerApp {
             file_explorer: FileExplorer::new(),
             editor_panel: EditorPanel::new(),
             current_document: None,
+            current_pdf_path: None,
             documents: Vec::new(),
             selected_page: 0,
             stamps: Vec::new(),
             text_annotations: Vec::new(),
+            has_unsaved_changes: false,
             show_split_dialog: false,
             show_stamp_panel: false,
             show_text_panel: false,
@@ -79,6 +89,7 @@ impl PdfViewerApp {
             pdf_thumbnails: Vec::new(),
             current_folder: None,
             custom_stamps: Vec::new(),
+            custom_stamp_textures: Vec::new(),
             context_menu_pdf: None,
             status_message: "準備完了".to_string(),
         }
@@ -90,13 +101,26 @@ impl PdfViewerApp {
             Ok(doc) => {
                 self.status_message = format!("開きました: {}", path.display());
                 self.current_document = Some(doc);
+                self.current_pdf_path = Some(path);
                 self.selected_page = 0;
+                self.stamps.clear();
+                self.text_annotations.clear();
+                self.has_unsaved_changes = false;
                 self.editor_panel.invalidate_cache();
             }
             Err(e) => {
                 self.status_message = format!("エラー: {}", e);
                 log::error!("PDFを開けません: {}", e);
             }
+        }
+    }
+
+    /// 上書き保存
+    fn save_current(&mut self) {
+        if let Some(ref path) = self.current_pdf_path.clone() {
+            self.save_pdf(path);
+        } else {
+            self.status_message = "保存先が指定されていません".to_string();
         }
     }
 
@@ -132,7 +156,7 @@ impl PdfViewerApp {
         }
     }
 
-    /// フォルダ内のPDFを更新
+    /// フォルダ内のPDFを更新（新しい順）
     pub fn update_folder_pdfs(&mut self, folder_path: &PathBuf) {
         self.folder_pdfs.clear();
         self.pdf_thumbnails.clear();
@@ -144,13 +168,16 @@ impl PdfViewerApp {
                 let path = entry.path();
                 if path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("pdf")) {
                     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    self.folder_pdfs.push(FolderPdfEntry { path, name });
+                    let modified = entry.metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    self.folder_pdfs.push(FolderPdfEntry { path, name, modified });
                 }
             }
         }
 
-        // 名前でソート
-        self.folder_pdfs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        // 新しい順にソート（更新日時の降順）
+        self.folder_pdfs.sort_by(|a, b| b.modified.cmp(&a.modified));
         self.pdf_thumbnails.resize(self.folder_pdfs.len(), None);
     }
 
@@ -171,8 +198,7 @@ impl PdfViewerApp {
             match doc.save(path) {
                 Ok(_) => {
                     self.status_message = format!("保存しました: {}", path.display());
-                    self.stamps.clear();
-                    self.text_annotations.clear();
+                    self.has_unsaved_changes = false;
                 }
                 Err(e) => {
                     self.status_message = format!("保存エラー: {}", e);
@@ -232,11 +258,15 @@ impl PdfViewerApp {
     /// ページを回転
     fn rotate_page(&mut self, page: usize, angle: i32) {
         if let Some(ref mut doc) = self.current_document {
-            if let Err(e) = PdfOperations::rotate_page(doc, page, angle) {
-                self.status_message = format!("回転エラー: {}", e);
-            } else {
-                self.status_message = format!("ページ {} を {}° 回転しました", page + 1, angle);
-                self.editor_panel.invalidate_cache();
+            match PdfOperations::rotate_page(doc, page, angle) {
+                Ok(_) => {
+                    self.status_message = format!("ページ {} を {}° 回転しました", page + 1, angle);
+                    self.editor_panel.invalidate_cache();
+                    self.has_unsaved_changes = true;
+                }
+                Err(e) => {
+                    self.status_message = format!("回転エラー: {}", e);
+                }
             }
         }
     }
@@ -247,7 +277,6 @@ impl PdfViewerApp {
         file_copied: Option<(PathBuf, PathBuf)>,
         file_deleted: Option<PathBuf>
     ) {
-        // ファイル移動
         if let Some((src, dest)) = file_moved {
             match std::fs::rename(&src, &dest) {
                 Ok(_) => {
@@ -262,7 +291,6 @@ impl PdfViewerApp {
             }
         }
 
-        // ファイルコピー
         if let Some((src, dest)) = file_copied {
             if src.is_dir() {
                 match copy_dir_all(&src, &dest) {
@@ -291,7 +319,6 @@ impl PdfViewerApp {
             }
         }
 
-        // ファイル削除
         if let Some(path) = file_deleted {
             let result = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
@@ -313,14 +340,54 @@ impl PdfViewerApp {
         }
     }
 
-    /// カスタムスタンプを登録
+    /// カスタムスタンプを登録（PNG透過対応）
     fn register_custom_stamp(&mut self, path: PathBuf) {
-        let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-        self.custom_stamps.push(CustomStamp {
-            name,
-            path: path.clone(),
-        });
-        self.status_message = format!("スタンプを登録しました: {}", path.display());
+        match image::open(&path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (width, height) = rgba.dimensions();
+                let image_data = rgba.into_raw();
+                
+                let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                self.custom_stamps.push(CustomStamp {
+                    name: name.clone(),
+                    path: path.clone(),
+                    image_data,
+                    width,
+                    height,
+                });
+                self.custom_stamp_textures.push(None);
+                self.status_message = format!("スタンプを登録しました: {}", name);
+            }
+            Err(e) => {
+                self.status_message = format!("画像の読み込みエラー: {}", e);
+            }
+        }
+    }
+
+    /// カスタムスタンプのテクスチャを取得/生成
+    fn get_custom_stamp_texture(&mut self, ctx: &egui::Context, index: usize) -> Option<TextureHandle> {
+        if index >= self.custom_stamps.len() {
+            return None;
+        }
+
+        if self.custom_stamp_textures.get(index).and_then(|t| t.as_ref()).is_none() {
+            let stamp = &self.custom_stamps[index];
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [stamp.width as usize, stamp.height as usize],
+                &stamp.image_data,
+            );
+            let texture = ctx.load_texture(
+                format!("custom_stamp_{}", index),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            if index < self.custom_stamp_textures.len() {
+                self.custom_stamp_textures[index] = Some(texture);
+            }
+        }
+
+        self.custom_stamp_textures.get(index).and_then(|t| t.clone())
     }
 }
 
@@ -354,7 +421,14 @@ impl eframe::App for PdfViewerApp {
                         }
                         ui.close_menu();
                     }
-                    if ui.button("💾 保存...").clicked() {
+                    
+                    let save_enabled = self.current_pdf_path.is_some();
+                    if ui.add_enabled(save_enabled, egui::Button::new("💾 上書き保存")).clicked() {
+                        self.save_current();
+                        ui.close_menu();
+                    }
+                    
+                    if ui.button("📄 名前を付けて保存...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PDF", &["pdf"])
                             .set_file_name("output.pdf")
@@ -364,7 +438,9 @@ impl eframe::App for PdfViewerApp {
                         }
                         ui.close_menu();
                     }
+                    
                     ui.separator();
+                    
                     if ui.button("➕ 結合用PDFを追加...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PDF", &["pdf"])
@@ -394,17 +470,19 @@ impl eframe::App for PdfViewerApp {
                 });
 
                 ui.menu_button("編集", |ui| {
-                    if ui.button("🔄 90°回転").clicked() {
+                    let has_doc = self.current_document.is_some();
+                    
+                    if ui.add_enabled(has_doc, egui::Button::new("🔄 90°回転")).clicked() {
                         let page = self.selected_page;
                         self.rotate_page(page, 90);
                         ui.close_menu();
                     }
-                    if ui.button("🔄 180°回転").clicked() {
+                    if ui.add_enabled(has_doc, egui::Button::new("🔄 180°回転")).clicked() {
                         let page = self.selected_page;
                         self.rotate_page(page, 180);
                         ui.close_menu();
                     }
-                    if ui.button("🔄 270°回転").clicked() {
+                    if ui.add_enabled(has_doc, egui::Button::new("🔄 270°回転")).clicked() {
                         let page = self.selected_page;
                         self.rotate_page(page, 270);
                         ui.close_menu();
@@ -426,6 +504,13 @@ impl eframe::App for PdfViewerApp {
                 });
 
                 ui.menu_button("表示", |ui| {
+                    if ui.button("🔄 フォルダを更新").clicked() {
+                        if let Some(ref folder) = self.current_folder.clone() {
+                            self.update_folder_pdfs(folder);
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("🌙 ダークモード").clicked() {
                         ctx.set_visuals(egui::Visuals::dark());
                         ui.close_menu();
@@ -441,7 +526,12 @@ impl eframe::App for PdfViewerApp {
         // ステータスバー
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // 未保存マーク
+                if self.has_unsaved_changes {
+                    ui.label(egui::RichText::new("●").color(Color32::RED));
+                }
                 ui.label(&self.status_message);
+                
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(ref doc) = self.current_document {
                         ui.label(format!(
@@ -450,11 +540,14 @@ impl eframe::App for PdfViewerApp {
                             doc.page_count()
                         ));
                     }
+                    if !self.custom_stamps.is_empty() {
+                        ui.label(format!("| スタンプ: {} 個", self.custom_stamps.len()));
+                    }
                 });
             });
         });
 
-        // 左パネル: ファイルエクスプローラー（ツリー表示）
+        // 左パネル: ファイルエクスプローラー
         egui::SidePanel::left("file_explorer")
             .default_width(250.0)
             .resizable(true)
@@ -463,17 +556,14 @@ impl eframe::App for PdfViewerApp {
                 ui.separator();
                 let file_result = self.file_explorer.show(ui);
                 
-                // フォルダが選択された場合
                 if let Some(folder_path) = file_result.selected_folder {
                     self.update_folder_pdfs(&folder_path);
                 }
                 
-                // PDFファイルが選択された場合
                 if let Some(file_path) = file_result.selected_file {
                     self.open_pdf(file_path);
                 }
                 
-                // ファイル操作
                 self.handle_file_operations(
                     file_result.file_moved,
                     file_result.file_copied,
@@ -481,16 +571,41 @@ impl eframe::App for PdfViewerApp {
                 );
             });
 
-        // 右パネル: プレビュー（シンプル版）
+        // 右パネル: プレビュー
         let has_document = self.current_document.is_some();
         let page_count = self.current_document.as_ref().map(|d| d.page_count()).unwrap_or(0);
+        
+        // カスタムスタンプ情報を収集（先にテクスチャを生成）
+        for i in 0..self.custom_stamps.len() {
+            let _ = self.get_custom_stamp_texture(ctx, i);
+        }
+        
+        let custom_stamp_info: Vec<(String, Option<TextureHandle>)> = self.custom_stamps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let tex = self.custom_stamp_textures.get(i).and_then(|t| t.clone());
+                (s.name.clone(), tex)
+            })
+            .collect();
         
         egui::SidePanel::right("preview_panel")
             .default_width(500.0)
             .min_width(300.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("📄 プレビュー");
+                // タイトルと保存ボタン
+                ui.horizontal(|ui| {
+                    ui.heading("📄 プレビュー");
+                    
+                    if self.has_unsaved_changes {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("💾 保存").clicked() {
+                                self.save_current();
+                            }
+                        });
+                    }
+                });
                 ui.separator();
 
                 if has_document {
@@ -535,7 +650,7 @@ impl eframe::App for PdfViewerApp {
 
                     ui.separator();
 
-                    // プレビュー（スクロール可能、全体を使用）
+                    // プレビュー
                     let mut new_stamp = None;
                     let mut new_text = None;
                     
@@ -543,7 +658,7 @@ impl eframe::App for PdfViewerApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if let Some(ref doc) = self.current_document {
-                                let editor_result = self.editor_panel.show(
+                                let editor_result = self.editor_panel.show_with_custom_stamps(
                                     ui,
                                     doc,
                                     self.selected_page,
@@ -551,6 +666,7 @@ impl eframe::App for PdfViewerApp {
                                     &self.text_annotations,
                                     self.show_stamp_panel,
                                     self.show_text_panel,
+                                    &custom_stamp_info,
                                 );
                                 new_stamp = editor_result.new_stamp;
                                 new_text = editor_result.new_text;
@@ -559,9 +675,11 @@ impl eframe::App for PdfViewerApp {
 
                     if let Some(stamp) = new_stamp {
                         self.stamps.push(stamp);
+                        self.has_unsaved_changes = true;
                     }
                     if let Some(annotation) = new_text {
                         self.text_annotations.push(annotation);
+                        self.has_unsaved_changes = true;
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -570,17 +688,24 @@ impl eframe::App for PdfViewerApp {
                 }
             });
 
-        // 中央パネル: フォルダ内PDFサムネイル一覧
+        // 中央パネル: フォルダ内PDFサムネイル一覧（新しい順）
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.folder_pdfs.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.label("左側のフォルダを選択すると、PDFファイルが表示されます");
                 });
             } else {
-                ui.heading(format!("📚 PDFファイル ({} 件)", self.folder_pdfs.len()));
+                ui.horizontal(|ui| {
+                    ui.heading(format!("📚 PDFファイル ({} 件)", self.folder_pdfs.len()));
+                    ui.label("- 新しい順");
+                    if ui.button("🔄").on_hover_text("更新").clicked() {
+                        if let Some(ref folder) = self.current_folder.clone() {
+                            self.update_folder_pdfs(folder);
+                        }
+                    }
+                });
                 ui.separator();
 
-                // サムネイルデータを事前にコピー
                 let folder_pdfs: Vec<(usize, PathBuf, String, bool, Option<egui::TextureId>)> = self
                     .folder_pdfs
                     .iter()
@@ -631,13 +756,11 @@ impl eframe::App for PdfViewerApp {
                                             ui.set_height(thumb_height);
 
                                             ui.vertical_centered(|ui| {
-                                                // サムネイル表示エリア
                                                 let (rect, response) = ui.allocate_exact_size(
                                                     Vec2::new(thumb_width - 16.0, thumb_height - 50.0),
                                                     egui::Sense::click(),
                                                 );
 
-                                                // サムネイルを描画
                                                 if let Some(texture_id) = tex_id {
                                                     ui.painter().image(
                                                         *texture_id,
@@ -660,19 +783,16 @@ impl eframe::App for PdfViewerApp {
                                                     thumbnails_to_load.push((*idx, path.clone()));
                                                 }
 
-                                                // クリック処理
                                                 if response.clicked() {
                                                     clicked_pdf = Some((*idx, path.clone()));
                                                 }
                                                 
-                                                // 右クリック処理
                                                 if response.secondary_clicked() {
                                                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                                                         right_clicked_pdf = Some((*idx, pos));
                                                     }
                                                 }
 
-                                                // ファイル名
                                                 ui.add_space(4.0);
                                                 ui.label(
                                                     egui::RichText::new(name)
@@ -682,7 +802,6 @@ impl eframe::App for PdfViewerApp {
                                             });
                                         });
 
-                                    // フレーム全体の右クリック
                                     if frame_response.response.secondary_clicked() {
                                         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                                             right_clicked_pdf = Some((*idx, pos));
@@ -696,7 +815,6 @@ impl eframe::App for PdfViewerApp {
                             });
                     });
 
-                // サムネイル生成（最初の数個のみ）
                 for (idx, path) in thumbnails_to_load.into_iter().take(3) {
                     if let Ok(doc) = PdfDocument::open(&path) {
                         if let Some(image) = doc.render_page_thumbnail(0, 160, 200) {
@@ -712,13 +830,11 @@ impl eframe::App for PdfViewerApp {
                     }
                 }
 
-                // クリック処理
                 if let Some((idx, path)) = clicked_pdf {
                     self.selected_pdf_index = Some(idx);
                     self.open_pdf(path);
                 }
 
-                // 右クリックでコンテキストメニュー表示
                 if let Some((idx, pos)) = right_clicked_pdf {
                     self.context_menu_pdf = Some((idx, pos));
                 }
@@ -782,7 +898,6 @@ impl eframe::App for PdfViewerApp {
                     });
                 });
 
-            // メニュー外クリックで閉じる
             if ctx.input(|i| i.pointer.any_click()) {
                 let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
                 if let Some(click_pos) = pointer_pos {
@@ -828,22 +943,43 @@ impl eframe::App for PdfViewerApp {
 
         // スタンプ登録ダイアログ
         if self.show_stamp_register_dialog {
+            // 事前にテクスチャを準備
+            let stamp_textures: Vec<(String, Option<egui::TextureId>)> = self.custom_stamps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let tex_id = self.custom_stamp_textures.get(i)
+                        .and_then(|t| t.as_ref().map(|t| t.id()));
+                    (s.name.clone(), tex_id)
+                })
+                .collect();
+            
+            let mut add_stamp_path: Option<PathBuf> = None;
+            let mut close_dialog = false;
+            
             egui::Window::new("🖼 カスタムスタンプ登録")
                 .collapsible(false)
                 .resizable(true)
                 .show(ctx, |ui| {
-                    ui.label("PNG画像ファイルを選択して、カスタムスタンプとして登録できます。");
+                    ui.label("PNG画像（透過対応）を選択して、スタンプとして登録できます。");
                     ui.separator();
                     
-                    // 既存のカスタムスタンプ一覧
-                    if !self.custom_stamps.is_empty() {
-                        ui.label(format!("登録済みスタンプ: {} 個", self.custom_stamps.len()));
+                    if !stamp_textures.is_empty() {
+                        ui.label(format!("登録済みスタンプ: {} 個", stamp_textures.len()));
                         egui::ScrollArea::vertical()
-                            .max_height(150.0)
+                            .max_height(200.0)
                             .show(ui, |ui| {
-                                for stamp in &self.custom_stamps {
-                                    ui.label(format!("• {}", stamp.name));
-                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    for (name, tex_id) in &stamp_textures {
+                                        ui.group(|ui| {
+                                            ui.set_width(80.0);
+                                            if let Some(id) = tex_id {
+                                                ui.image((*id, Vec2::new(60.0, 60.0)));
+                                            }
+                                            ui.label(name);
+                                        });
+                                    }
+                                });
                             });
                         ui.separator();
                     }
@@ -851,18 +987,25 @@ impl eframe::App for PdfViewerApp {
                     ui.horizontal(|ui| {
                         if ui.button("📂 PNG画像を追加...").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("PNG", &["png"])
+                                .add_filter("PNG画像", &["png"])
                                 .pick_file()
                             {
-                                self.register_custom_stamp(path);
+                                add_stamp_path = Some(path);
                             }
                         }
                         
                         if ui.button("閉じる").clicked() {
-                            self.show_stamp_register_dialog = false;
+                            close_dialog = true;
                         }
                     });
                 });
+            
+            if let Some(path) = add_stamp_path {
+                self.register_custom_stamp(path);
+            }
+            if close_dialog {
+                self.show_stamp_register_dialog = false;
+            }
         }
     }
 }

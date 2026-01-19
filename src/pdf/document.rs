@@ -7,7 +7,6 @@ use std::path::Path;
 
 /// PDFiumライブラリを取得
 fn get_pdfium() -> Result<Pdfium> {
-    // 実行ファイルと同じディレクトリからPDFiumを読み込み
     let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
         .or_else(|_| Pdfium::bind_to_system_library())
         .context("PDFiumライブラリを読み込めませんでした")?;
@@ -19,6 +18,7 @@ pub struct PdfDocument {
     path: std::path::PathBuf,
     page_count: usize,
     page_sizes: Vec<(f32, f32)>,
+    page_rotations: Vec<i32>, // 各ページの回転角度（0, 90, 180, 270）
 }
 
 impl PdfDocument {
@@ -32,18 +32,21 @@ impl PdfDocument {
 
         let page_count = document.pages().len();
 
-        // 各ページのサイズを取得
         let mut page_sizes = Vec::with_capacity(page_count as usize);
+        let mut page_rotations = Vec::with_capacity(page_count as usize);
+        
         for page in document.pages().iter() {
             let width = page.width().value;
             let height = page.height().value;
             page_sizes.push((width, height));
+            page_rotations.push(0); // 初期回転は0度
         }
 
         Ok(Self {
             path: path.to_path_buf(),
             page_count: page_count as usize,
             page_sizes,
+            page_rotations,
         })
     }
 
@@ -52,15 +55,47 @@ impl PdfDocument {
         self.page_count
     }
 
-    /// ページサイズを取得 (ポイント単位)
+    /// ページサイズを取得 (ポイント単位、回転考慮)
     pub fn page_size(&self, page_index: usize) -> (f32, f32) {
-        self.page_sizes
+        let base_size = self.page_sizes
             .get(page_index)
             .copied()
-            .unwrap_or((612.0, 792.0))
+            .unwrap_or((612.0, 792.0));
+        
+        let rotation = self.page_rotations.get(page_index).copied().unwrap_or(0);
+        
+        // 90度または270度の場合は幅と高さを入れ替え
+        if rotation == 90 || rotation == 270 {
+            (base_size.1, base_size.0)
+        } else {
+            base_size
+        }
     }
 
-    /// ページをレンダリング
+    /// ページを回転
+    pub fn rotate_page(&mut self, page_index: usize, degrees: i32) -> Result<()> {
+        if page_index >= self.page_count {
+            return Err(anyhow::anyhow!("無効なページ番号"));
+        }
+        
+        // 現在の回転に追加
+        let current = self.page_rotations.get(page_index).copied().unwrap_or(0);
+        let new_rotation = (current + degrees) % 360;
+        let new_rotation = if new_rotation < 0 { new_rotation + 360 } else { new_rotation };
+        
+        if page_index < self.page_rotations.len() {
+            self.page_rotations[page_index] = new_rotation;
+        }
+        
+        Ok(())
+    }
+
+    /// ページの回転角度を取得
+    pub fn get_page_rotation(&self, page_index: usize) -> i32 {
+        self.page_rotations.get(page_index).copied().unwrap_or(0)
+    }
+
+    /// ページをレンダリング（回転対応）
     pub fn render_page(
         &self,
         page_index: usize,
@@ -68,27 +103,43 @@ impl PdfDocument {
         height: u32,
     ) -> Option<egui::ColorImage> {
         let pdfium = get_pdfium().ok()?;
-
         let document = pdfium.load_pdf_from_file(&self.path, None).ok()?;
-
         let page = document.pages().get(page_index as u16).ok()?;
+
+        let rotation = self.page_rotations.get(page_index).copied().unwrap_or(0);
 
         // ページサイズ
         let page_width = page.width().value;
         let page_height = page.height().value;
 
+        // 回転によるサイズ調整
+        let (effective_width, effective_height) = if rotation == 90 || rotation == 270 {
+            (page_height, page_width)
+        } else {
+            (page_width, page_height)
+        };
+
         // スケール計算
-        let scale_x = width as f32 / page_width;
-        let scale_y = height as f32 / page_height;
+        let scale_x = width as f32 / effective_width;
+        let scale_y = height as f32 / effective_height;
         let scale = scale_x.min(scale_y);
 
-        let render_width = (page_width * scale) as i32;
-        let render_height = (page_height * scale) as i32;
+        let render_width = (effective_width * scale) as i32;
+        let render_height = (effective_height * scale) as i32;
+
+        // 回転設定
+        let rotation_setting = match rotation {
+            90 => PdfPageRenderRotation::Degrees90,
+            180 => PdfPageRenderRotation::Degrees180,
+            270 => PdfPageRenderRotation::Degrees270,
+            _ => PdfPageRenderRotation::None,
+        };
 
         // ページをレンダリング
         let render_config = PdfRenderConfig::new()
             .set_target_width(render_width)
             .set_target_height(render_height)
+            .rotate(rotation_setting, true)
             .render_form_data(true)
             .render_annotations(true);
 
@@ -135,8 +186,9 @@ impl PdfDocument {
             if let Ok(document) = pdfium.load_pdf_from_file(&self.path, None) {
                 self.page_count = document.pages().len() as usize;
 
-                // ページサイズも更新
                 self.page_sizes.clear();
+                self.page_rotations.resize(self.page_count, 0);
+                
                 for page in document.pages().iter() {
                     let width = page.width().value;
                     let height = page.height().value;
@@ -148,11 +200,11 @@ impl PdfDocument {
 
     /// PDFを保存
     pub fn save(&self, path: &Path) -> Result<()> {
-        // PDFiumでの保存はより複雑なため、
-        // 単純なファイルコピーを使用します
         if self.path != path {
             std::fs::copy(&self.path, path).context("PDFを保存できませんでした")?;
         }
+        // 注: 回転情報は現在ファイルには保存されません
+        // 実際の回転保存にはPDFiumの編集機能が必要です
         Ok(())
     }
 }
@@ -163,6 +215,7 @@ impl Clone for PdfDocument {
             path: self.path.clone(),
             page_count: self.page_count,
             page_sizes: self.page_sizes.clone(),
+            page_rotations: self.page_rotations.clone(),
         }
     }
 }
