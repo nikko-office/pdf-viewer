@@ -1,7 +1,7 @@
 //! アプリケーションの状態管理
 
 use crate::pdf::{PdfDocument, PdfOperations, Stamp, TextAnnotation};
-use crate::ui::{EditorPanel, FileExplorer, ThumbnailPanel};
+use crate::ui::{EditorPanel, FileExplorer};
 use eframe::egui::{self, Color32, TextureHandle, Vec2};
 use std::path::PathBuf;
 use std::process::Command;
@@ -10,7 +10,6 @@ use std::process::Command;
 pub struct PdfViewerApp {
     // UI パネル
     file_explorer: FileExplorer,
-    thumbnail_panel: ThumbnailPanel,
     editor_panel: EditorPanel,
 
     // PDF ドキュメント
@@ -39,9 +38,6 @@ pub struct PdfViewerApp {
     // カスタムスタンプ
     custom_stamps: Vec<CustomStamp>,
 
-    // プレビューパネルのサイズ（ピクセル）
-    preview_height: f32,
-
     // コンテキストメニュー
     context_menu_pdf: Option<(usize, egui::Pos2)>,
 
@@ -66,7 +62,6 @@ impl PdfViewerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             file_explorer: FileExplorer::new(),
-            thumbnail_panel: ThumbnailPanel::new(),
             editor_panel: EditorPanel::new(),
             current_document: None,
             documents: Vec::new(),
@@ -84,7 +79,6 @@ impl PdfViewerApp {
             pdf_thumbnails: Vec::new(),
             current_folder: None,
             custom_stamps: Vec::new(),
-            preview_height: 400.0,
             context_menu_pdf: None,
             status_message: "準備完了".to_string(),
         }
@@ -95,9 +89,9 @@ impl PdfViewerApp {
         match PdfDocument::open(&path) {
             Ok(doc) => {
                 self.status_message = format!("開きました: {}", path.display());
-                self.thumbnail_panel.load_thumbnails(&doc);
                 self.current_document = Some(doc);
                 self.selected_page = 0;
+                self.editor_panel.invalidate_cache();
             }
             Err(e) => {
                 self.status_message = format!("エラー: {}", e);
@@ -197,10 +191,9 @@ impl PdfViewerApp {
         match PdfOperations::merge(&self.documents) {
             Ok(merged) => {
                 self.current_document = Some(merged);
-                self.thumbnail_panel
-                    .load_thumbnails(self.current_document.as_ref().unwrap());
                 self.status_message = "PDFを結合しました".to_string();
                 self.documents.clear();
+                self.editor_panel.invalidate_cache();
             }
             Err(e) => {
                 self.status_message = format!("結合エラー: {}", e);
@@ -244,7 +237,6 @@ impl PdfViewerApp {
             } else {
                 self.status_message = format!("ページ {} を {}° 回転しました", page + 1, angle);
                 self.editor_panel.invalidate_cache();
-                self.thumbnail_panel.load_thumbnails(doc);
             }
         }
     }
@@ -489,7 +481,7 @@ impl eframe::App for PdfViewerApp {
                 );
             });
 
-        // 右パネル: プレビュー
+        // 右パネル: プレビュー（シンプル版）
         let has_document = self.current_document.is_some();
         let page_count = self.current_document.as_ref().map(|d| d.page_count()).unwrap_or(0);
         
@@ -508,21 +500,21 @@ impl eframe::App for PdfViewerApp {
                     let mut rotate_clicked = false;
                     
                     ui.horizontal(|ui| {
-                        prev_clicked = ui.button("◀").clicked() && self.selected_page > 0;
-                        ui.label(format!("{} / {}", self.selected_page + 1, page_count));
-                        next_clicked = ui.button("▶").clicked() && self.selected_page < page_count - 1;
+                        prev_clicked = ui.button("◀ 前").clicked() && self.selected_page > 0;
+                        ui.label(format!("  {} / {}  ", self.selected_page + 1, page_count));
+                        next_clicked = ui.button("次 ▶").clicked() && self.selected_page < page_count - 1;
 
                         ui.separator();
 
-                        rotate_clicked = ui.button("🔄").on_hover_text("90°回転").clicked();
+                        rotate_clicked = ui.button("🔄 回転").clicked();
 
                         ui.separator();
 
-                        if ui.selectable_label(self.show_stamp_panel, "✅").on_hover_text("スタンプ").clicked() {
+                        if ui.selectable_label(self.show_stamp_panel, "✅ スタンプ").clicked() {
                             self.show_stamp_panel = !self.show_stamp_panel;
                             self.show_text_panel = false;
                         }
-                        if ui.selectable_label(self.show_text_panel, "📝").on_hover_text("テキスト").clicked() {
+                        if ui.selectable_label(self.show_text_panel, "📝 テキスト").clicked() {
                             self.show_text_panel = !self.show_text_panel;
                             self.show_stamp_panel = false;
                         }
@@ -543,22 +535,12 @@ impl eframe::App for PdfViewerApp {
 
                     ui.separator();
 
-                    // プレビュー高さ調整スライダー
-                    ui.horizontal(|ui| {
-                        ui.label("プレビュー高さ:");
-                        if ui.add(egui::Slider::new(&mut self.preview_height, 100.0..=800.0).suffix("px")).changed() {
-                            ctx.request_repaint();
-                        }
-                    });
-
-                    ui.separator();
-
-                    // 上部: プレビュー
+                    // プレビュー（スクロール可能、全体を使用）
                     let mut new_stamp = None;
                     let mut new_text = None;
                     
-                    egui::ScrollArea::vertical()
-                        .max_height(self.preview_height)
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if let Some(ref doc) = self.current_document {
                                 let editor_result = self.editor_panel.show(
@@ -580,32 +562,6 @@ impl eframe::App for PdfViewerApp {
                     }
                     if let Some(annotation) = new_text {
                         self.text_annotations.push(annotation);
-                    }
-
-                    ui.separator();
-
-                    // 下部: ページサムネイル
-                    ui.label("ページ一覧:");
-                    let mut selected_page_from_thumb = None;
-                    let mut rotate_from_thumb = None;
-                    
-                    egui::ScrollArea::horizontal()
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if let Some(ref doc) = self.current_document {
-                                    let result = self.thumbnail_panel.show_horizontal(ui, doc, self.selected_page);
-                                    selected_page_from_thumb = result.selected_page;
-                                    rotate_from_thumb = result.page_rotated;
-                                }
-                            });
-                        });
-
-                    if let Some(page) = selected_page_from_thumb {
-                        self.selected_page = page;
-                        self.editor_panel.invalidate_cache();
-                    }
-                    if let Some((page, angle)) = rotate_from_thumb {
-                        self.rotate_page(page, angle);
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
