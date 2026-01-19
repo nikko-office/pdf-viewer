@@ -19,6 +19,7 @@ pub struct EditorPanel {
     // ページテクスチャのキャッシュ
     page_texture: Option<TextureHandle>,
     current_page_index: Option<usize>,
+    cached_rotation: i32,
 
     // ズーム
     zoom: f32,
@@ -45,6 +46,7 @@ impl EditorPanel {
         Self {
             page_texture: None,
             current_page_index: None,
+            cached_rotation: 0,
             zoom: 1.0,
             selected_stamp_type: StampType::Approved,
             selected_custom_stamp_index: None,
@@ -56,6 +58,80 @@ impl EditorPanel {
             selected_text_index: None,
             dragging: false,
             drag_offset: Vec2::ZERO,
+        }
+    }
+
+    /// PDF座標から表示座標に変換（回転考慮）
+    fn pdf_to_display(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        orig_w: f32,
+        orig_h: f32,
+        rotation: i32,
+    ) -> (f32, f32, f32, f32) {
+        match rotation {
+            90 => {
+                // 90度回転: (x, y) → (orig_h - y - height, x)
+                let new_x = orig_h - y - height;
+                let new_y = x;
+                (new_x, new_y, height, width)
+            }
+            180 => {
+                // 180度回転: (x, y) → (orig_w - x - width, orig_h - y - height)
+                let new_x = orig_w - x - width;
+                let new_y = orig_h - y - height;
+                (new_x, new_y, width, height)
+            }
+            270 => {
+                // 270度回転: (x, y) → (y, orig_w - x - width)
+                let new_x = y;
+                let new_y = orig_w - x - width;
+                (new_x, new_y, height, width)
+            }
+            _ => {
+                // 0度または未対応: そのまま
+                (x, y, width, height)
+            }
+        }
+    }
+
+    /// 表示座標からPDF座標に変換（回転考慮）
+    fn display_to_pdf(
+        &self,
+        display_x: f32,
+        display_y: f32,
+        width: f32,
+        height: f32,
+        orig_w: f32,
+        orig_h: f32,
+        rotation: i32,
+    ) -> (f32, f32) {
+        match rotation {
+            90 => {
+                // 逆変換: (dx, dy) → (dy, orig_h - dx - height)
+                let pdf_x = display_y;
+                let pdf_y = orig_h - display_x - width;
+                (pdf_x, pdf_y)
+            }
+            180 => {
+                // 逆変換: (dx, dy) → (orig_w - dx - width, orig_h - dy - height)
+                let pdf_x = orig_w - display_x - width;
+                let pdf_y = orig_h - display_y - height;
+                (pdf_x, pdf_y)
+            }
+            270 => {
+                // 逆変換: (dx, dy) → (orig_w - dy - height, dx)
+                let pdf_x = orig_w - display_y - height;
+                let pdf_y = display_x;
+                (pdf_x, pdf_y)
+            }
+            _ => {
+                // 0度: そのまま
+                (display_x, display_y)
+            }
         }
     }
 
@@ -73,6 +149,11 @@ impl EditorPanel {
     ) -> EditorResult {
         let mut result = EditorResult::default();
 
+        // 回転情報を取得
+        let rotation = doc.get_page_rotation(page_index);
+        let orig_size = doc.original_page_size(page_index);
+        let (orig_w, orig_h) = orig_size;
+
         // ズームコントロール
         ui.horizontal(|ui| {
             ui.label("ズーム:");
@@ -89,6 +170,9 @@ impl EditorPanel {
                 self.zoom = 1.0;
                 self.invalidate_page_cache();
             }
+            
+            ui.separator();
+            ui.label(format!("回転: {}°", rotation));
             
             ui.separator();
             
@@ -189,15 +273,16 @@ impl EditorPanel {
         ui.label("💡 ヒント: クリックで選択、ドラッグで移動、選択後に削除ボタンで削除");
         ui.separator();
 
-        // ページテクスチャを更新
-        if self.current_page_index != Some(page_index) {
+        // ページテクスチャを更新（ページ変更または回転変更時）
+        if self.current_page_index != Some(page_index) || self.cached_rotation != rotation {
             self.current_page_index = Some(page_index);
+            self.cached_rotation = rotation;
             self.page_texture = None;
             self.selected_stamp_index = None;
             self.selected_text_index = None;
         }
 
-        // ページサイズ計算
+        // ページサイズ計算（回転後）
         let page_size = doc.page_size(page_index);
         let render_width = (page_size.0 * self.zoom) as u32;
         let render_height = (page_size.1 * self.zoom) as u32;
@@ -233,13 +318,19 @@ impl EditorPanel {
                 .filter(|(_, s)| s.page == page_index)
                 .collect();
 
-            // 既存のスタンプを描画
+            // 既存のスタンプを描画（回転変換を適用）
             for (global_idx, stamp) in &page_stamps {
-                let stamp_pos = egui::pos2(
-                    rect.min.x + stamp.x * self.zoom,
-                    rect.min.y + stamp.y * self.zoom,
+                // PDF座標から表示座標に変換
+                let (display_x, display_y, display_w, display_h) = self.pdf_to_display(
+                    stamp.x, stamp.y, stamp.width, stamp.height,
+                    orig_w, orig_h, rotation
                 );
-                let stamp_size = Vec2::new(stamp.width * self.zoom, stamp.height * self.zoom);
+
+                let stamp_pos = egui::pos2(
+                    rect.min.x + display_x * self.zoom,
+                    rect.min.y + display_y * self.zoom,
+                );
+                let stamp_size = Vec2::new(display_w * self.zoom, display_h * self.zoom);
                 let stamp_rect = egui::Rect::from_min_size(stamp_pos, stamp_size);
 
                 let is_selected = self.selected_stamp_index == Some(*global_idx);
@@ -293,16 +384,26 @@ impl EditorPanel {
                 .filter(|(_, t)| t.page == page_index)
                 .collect();
 
-            // 既存のテキスト注釈を描画
+            // 既存のテキスト注釈を描画（回転変換を適用）
             for (global_idx, annotation) in &page_texts {
+                // テキストサイズを推定
+                let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
+                let text_height = annotation.font_size;
+
+                // PDF座標から表示座標に変換
+                let (display_x, display_y, _, _) = self.pdf_to_display(
+                    annotation.x, annotation.y, text_width, text_height,
+                    orig_w, orig_h, rotation
+                );
+
                 let text_pos = egui::pos2(
-                    rect.min.x + annotation.x * self.zoom,
-                    rect.min.y + annotation.y * self.zoom,
+                    rect.min.x + display_x * self.zoom,
+                    rect.min.y + display_y * self.zoom,
                 );
                 
                 let is_selected = self.selected_text_index == Some(*global_idx);
                 
-                // テキストサイズを計算（おおよそ）
+                // テキストサイズを計算
                 let font = egui::FontId::proportional(annotation.font_size * self.zoom);
                 let galley = ui.painter().layout_no_wrap(
                     annotation.text.clone(),
@@ -337,9 +438,13 @@ impl EditorPanel {
                         
                         // スタンプをクリックしたか
                         for (global_idx, stamp) in page_stamps.iter().rev() {
+                            let (display_x, display_y, display_w, display_h) = self.pdf_to_display(
+                                stamp.x, stamp.y, stamp.width, stamp.height,
+                                orig_w, orig_h, rotation
+                            );
                             let stamp_rect = egui::Rect::from_min_size(
-                                egui::pos2(rect.min.x + stamp.x * self.zoom, rect.min.y + stamp.y * self.zoom),
-                                Vec2::new(stamp.width * self.zoom, stamp.height * self.zoom),
+                                egui::pos2(rect.min.x + display_x * self.zoom, rect.min.y + display_y * self.zoom),
+                                Vec2::new(display_w * self.zoom, display_h * self.zoom),
                             );
                             if stamp_rect.contains(pos) {
                                 self.selected_stamp_index = Some(*global_idx);
@@ -352,9 +457,15 @@ impl EditorPanel {
                         // テキストをクリックしたか
                         if !found {
                             for (global_idx, annotation) in page_texts.iter().rev() {
+                                let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
+                                let text_height = annotation.font_size;
+                                let (display_x, display_y, _, _) = self.pdf_to_display(
+                                    annotation.x, annotation.y, text_width, text_height,
+                                    orig_w, orig_h, rotation
+                                );
                                 let text_pos = egui::pos2(
-                                    rect.min.x + annotation.x * self.zoom,
-                                    rect.min.y + annotation.y * self.zoom,
+                                    rect.min.x + display_x * self.zoom,
+                                    rect.min.y + display_y * self.zoom,
                                 );
                                 let font = egui::FontId::proportional(annotation.font_size * self.zoom);
                                 let galley = ui.painter().layout_no_wrap(
@@ -385,18 +496,28 @@ impl EditorPanel {
                     if let Some(pos) = response.interact_pointer_pos() {
                         if let Some(idx) = self.selected_stamp_index {
                             if let Some(stamp) = stamps.get(idx) {
+                                let (display_x, display_y, _, _) = self.pdf_to_display(
+                                    stamp.x, stamp.y, stamp.width, stamp.height,
+                                    orig_w, orig_h, rotation
+                                );
                                 let stamp_pos = egui::pos2(
-                                    rect.min.x + stamp.x * self.zoom,
-                                    rect.min.y + stamp.y * self.zoom,
+                                    rect.min.x + display_x * self.zoom,
+                                    rect.min.y + display_y * self.zoom,
                                 );
                                 self.drag_offset = Vec2::new(pos.x - stamp_pos.x, pos.y - stamp_pos.y);
                                 self.dragging = true;
                             }
                         } else if let Some(idx) = self.selected_text_index {
                             if let Some(annotation) = text_annotations.get(idx) {
+                                let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
+                                let text_height = annotation.font_size;
+                                let (display_x, display_y, _, _) = self.pdf_to_display(
+                                    annotation.x, annotation.y, text_width, text_height,
+                                    orig_w, orig_h, rotation
+                                );
                                 let text_pos = egui::pos2(
-                                    rect.min.x + annotation.x * self.zoom,
-                                    rect.min.y + annotation.y * self.zoom,
+                                    rect.min.x + display_x * self.zoom,
+                                    rect.min.y + display_y * self.zoom,
                                 );
                                 self.drag_offset = Vec2::new(pos.x - text_pos.x, pos.y - text_pos.y);
                                 self.dragging = true;
@@ -413,13 +534,36 @@ impl EditorPanel {
                 // ドラッグ終了
                 if response.drag_stopped() && self.dragging {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        let new_x = (pos.x - rect.min.x - self.drag_offset.x) / self.zoom;
-                        let new_y = (pos.y - rect.min.y - self.drag_offset.y) / self.zoom;
+                        // 表示座標を計算
+                        let display_x = (pos.x - rect.min.x - self.drag_offset.x) / self.zoom;
+                        let display_y = (pos.y - rect.min.y - self.drag_offset.y) / self.zoom;
                         
                         if let Some(idx) = self.selected_stamp_index {
-                            result.move_stamp = Some((idx, new_x, new_y));
+                            if let Some(stamp) = stamps.get(idx) {
+                                // 回転に応じてサイズを調整
+                                let (w, h) = if rotation == 90 || rotation == 270 {
+                                    (stamp.height, stamp.width)
+                                } else {
+                                    (stamp.width, stamp.height)
+                                };
+                                // 表示座標からPDF座標に変換
+                                let (pdf_x, pdf_y) = self.display_to_pdf(
+                                    display_x, display_y, w, h,
+                                    orig_w, orig_h, rotation
+                                );
+                                result.move_stamp = Some((idx, pdf_x, pdf_y));
+                            }
                         } else if let Some(idx) = self.selected_text_index {
-                            result.move_text = Some((idx, new_x, new_y));
+                            if let Some(annotation) = text_annotations.get(idx) {
+                                let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
+                                let text_height = annotation.font_size;
+                                // 表示座標からPDF座標に変換
+                                let (pdf_x, pdf_y) = self.display_to_pdf(
+                                    display_x, display_y, text_width, text_height,
+                                    orig_w, orig_h, rotation
+                                );
+                                result.move_text = Some((idx, pdf_x, pdf_y));
+                            }
                         }
                     }
                     self.dragging = false;
@@ -430,8 +574,9 @@ impl EditorPanel {
             if self.placing_stamp {
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if rect.contains(hover_pos) {
-                        let preview_size = Vec2::new(100.0 * self.zoom, 50.0 * self.zoom);
-                        let preview_rect = egui::Rect::from_center_size(hover_pos, preview_size);
+                        let preview_w = 100.0 * self.zoom;
+                        let preview_h = 50.0 * self.zoom;
+                        let preview_rect = egui::Rect::from_center_size(hover_pos, Vec2::new(preview_w, preview_h));
                         
                         if let Some(idx) = self.selected_custom_stamp_index {
                             if let Some((_, Some(tex))) = custom_stamps.get(idx) {
@@ -469,8 +614,15 @@ impl EditorPanel {
 
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        let pdf_x = (pos.x - rect.min.x) / self.zoom - 50.0;
-                        let pdf_y = (pos.y - rect.min.y) / self.zoom - 25.0;
+                        // 表示座標を計算（中央配置のため半分引く）
+                        let display_x = (pos.x - rect.min.x) / self.zoom - 50.0;
+                        let display_y = (pos.y - rect.min.y) / self.zoom - 25.0;
+
+                        // 表示座標からPDF座標に変換
+                        let (pdf_x, pdf_y) = self.display_to_pdf(
+                            display_x, display_y, 100.0, 50.0,
+                            orig_w, orig_h, rotation
+                        );
 
                         result.new_stamp = Some(Stamp {
                             page: page_index,
@@ -502,8 +654,18 @@ impl EditorPanel {
 
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        let pdf_x = (pos.x - rect.min.x) / self.zoom;
-                        let pdf_y = (pos.y - rect.min.y) / self.zoom;
+                        // 表示座標を計算
+                        let display_x = (pos.x - rect.min.x) / self.zoom;
+                        let display_y = (pos.y - rect.min.y) / self.zoom;
+
+                        let text_width = self.text_input.len() as f32 * self.text_font_size * 0.6;
+                        let text_height = self.text_font_size;
+
+                        // 表示座標からPDF座標に変換
+                        let (pdf_x, pdf_y) = self.display_to_pdf(
+                            display_x, display_y, text_width, text_height,
+                            orig_w, orig_h, rotation
+                        );
 
                         result.new_text = Some(TextAnnotation {
                             page: page_index,

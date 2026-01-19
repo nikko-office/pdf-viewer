@@ -72,6 +72,14 @@ impl PdfDocument {
         }
     }
 
+    /// 元のページサイズを取得 (回転前)
+    pub fn original_page_size(&self, page_index: usize) -> (f32, f32) {
+        self.page_sizes
+            .get(page_index)
+            .copied()
+            .unwrap_or((612.0, 792.0))
+    }
+
     /// ページを回転
     pub fn rotate_page(&mut self, page_index: usize, degrees: i32) -> Result<()> {
         if page_index >= self.page_count {
