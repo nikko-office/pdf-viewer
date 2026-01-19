@@ -1,0 +1,31 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.pdb
+*.exe
+*.dll
+
+# PDFium library (download separately)
+pdfium.dll
+pdfium.zip
+pdfium_temp/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak

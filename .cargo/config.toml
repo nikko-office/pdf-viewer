@@ -1,0 +1,21 @@
+# Cargo設定 - Windowsスタティックリンク
+
+[target.x86_64-pc-windows-msvc]
+# C ランタイムをスタティックリンク
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[build]
+# デフォルトターゲット (x64 Windows)
+# target = "x86_64-pc-windows-msvc"
+
+[profile.release]
+# リリースビルドの最適化
+opt-level = 3
+lto = true
+codegen-units = 1
