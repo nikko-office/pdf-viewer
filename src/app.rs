@@ -710,6 +710,8 @@ impl eframe::App for PdfViewerApp {
                     let mut delete_text = None;
                     let mut move_stamp = None;
                     let mut move_text = None;
+                    let mut delete_custom_stamp = None;
+                    let mut register_stamp_clicked = false;
                     
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
@@ -731,6 +733,8 @@ impl eframe::App for PdfViewerApp {
                                 delete_text = editor_result.delete_text;
                                 move_stamp = editor_result.move_stamp;
                                 move_text = editor_result.move_text;
+                                delete_custom_stamp = editor_result.delete_custom_stamp;
+                                register_stamp_clicked = editor_result.register_stamp_clicked;
                             }
                         });
 
@@ -777,6 +781,21 @@ impl eframe::App for PdfViewerApp {
                             self.text_annotations[idx].y = new_y;
                             self.has_unsaved_changes = true;
                         }
+                    }
+                    // カスタムスタンプ削除
+                    if let Some(idx) = delete_custom_stamp {
+                        if idx < self.custom_stamps.len() {
+                            let name = self.custom_stamps[idx].name.clone();
+                            self.custom_stamps.remove(idx);
+                            if idx < self.custom_stamp_textures.len() {
+                                self.custom_stamp_textures.remove(idx);
+                            }
+                            self.status_message = format!("スタンプ「{}」を削除しました", name);
+                        }
+                    }
+                    // スタンプ登録ダイアログ
+                    if register_stamp_clicked {
+                        self.show_stamp_register_dialog = true;
                     }
                 } else {
                     ui.centered_and_justified(|ui| {

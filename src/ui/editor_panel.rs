@@ -12,6 +12,8 @@ pub struct EditorResult {
     pub delete_text: Option<usize>,
     pub move_stamp: Option<(usize, f32, f32)>,
     pub move_text: Option<(usize, f32, f32)>,
+    pub delete_custom_stamp: Option<usize>,
+    pub register_stamp_clicked: bool,
 }
 
 /// エディターパネルの状態
@@ -61,8 +63,8 @@ impl EditorPanel {
         }
     }
 
-    /// PDF座標から表示座標に変換（回転考慮）
-    fn pdf_to_display(
+    /// PDF座標から表示座標に変換（回転考慮、サイズは維持）
+    fn pdf_to_display_pos(
         &self,
         x: f32,
         y: f32,
@@ -71,29 +73,29 @@ impl EditorPanel {
         orig_w: f32,
         orig_h: f32,
         rotation: i32,
-    ) -> (f32, f32, f32, f32) {
+    ) -> (f32, f32) {
         match rotation {
             90 => {
                 // 90度回転: (x, y) → (orig_h - y - height, x)
                 let new_x = orig_h - y - height;
                 let new_y = x;
-                (new_x, new_y, height, width)
+                (new_x, new_y)
             }
             180 => {
                 // 180度回転: (x, y) → (orig_w - x - width, orig_h - y - height)
                 let new_x = orig_w - x - width;
                 let new_y = orig_h - y - height;
-                (new_x, new_y, width, height)
+                (new_x, new_y)
             }
             270 => {
                 // 270度回転: (x, y) → (y, orig_w - x - width)
                 let new_x = y;
                 let new_y = orig_w - x - width;
-                (new_x, new_y, height, width)
+                (new_x, new_y)
             }
             _ => {
-                // 0度または未対応: そのまま
-                (x, y, width, height)
+                // 0度: そのまま
+                (x, y)
             }
         }
     }
@@ -111,25 +113,21 @@ impl EditorPanel {
     ) -> (f32, f32) {
         match rotation {
             90 => {
-                // 逆変換: (dx, dy) → (dy, orig_h - dx - height)
                 let pdf_x = display_y;
-                let pdf_y = orig_h - display_x - width;
+                let pdf_y = orig_h - display_x - height;
                 (pdf_x, pdf_y)
             }
             180 => {
-                // 逆変換: (dx, dy) → (orig_w - dx - width, orig_h - dy - height)
                 let pdf_x = orig_w - display_x - width;
                 let pdf_y = orig_h - display_y - height;
                 (pdf_x, pdf_y)
             }
             270 => {
-                // 逆変換: (dx, dy) → (orig_w - dy - height, dx)
-                let pdf_x = orig_w - display_y - height;
+                let pdf_x = orig_w - display_y - width;
                 let pdf_y = display_x;
                 (pdf_x, pdf_y)
             }
             _ => {
-                // 0度: そのまま
                 (display_x, display_y)
             }
         }
@@ -183,7 +181,7 @@ impl EditorPanel {
                     result.delete_stamp = Some(idx);
                     self.selected_stamp_index = None;
                 }
-                if ui.button("✕ 選択解除").clicked() {
+                if ui.button("✕").clicked() {
                     self.selected_stamp_index = None;
                 }
             } else if let Some(idx) = self.selected_text_index {
@@ -192,60 +190,130 @@ impl EditorPanel {
                     result.delete_text = Some(idx);
                     self.selected_text_index = None;
                 }
-                if ui.button("✕ 選択解除").clicked() {
+                if ui.button("✕").clicked() {
                     self.selected_text_index = None;
                 }
             }
         });
 
-        // スタンプパネル
+        // スタンプパネル（サムネイル表示）
         if show_stamp_panel {
             ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("スタンプ:");
-                
-                let stamp_types = [
-                    (StampType::Approved, "✅承認"),
-                    (StampType::Rejected, "❌却下"),
-                    (StampType::Draft, "📝下書"),
-                    (StampType::Confidential, "🔒機密"),
-                ];
-
-                for (stamp_type, label) in &stamp_types {
-                    let selected = self.selected_custom_stamp_index.is_none() 
-                        && self.selected_stamp_type == *stamp_type;
-                    if ui.selectable_label(selected, *label).clicked() {
-                        self.selected_stamp_type = stamp_type.clone();
-                        self.selected_custom_stamp_index = None;
-                    }
-                }
-
-                for (i, (name, tex)) in custom_stamps.iter().enumerate() {
-                    let selected = self.selected_custom_stamp_index == Some(i);
-                    let response = ui.selectable_label(selected, format!("🖼{}", name));
-                    
-                    if let Some(texture) = tex {
-                        response.clone().on_hover_ui(|ui| {
-                            ui.image((texture.id(), Vec2::new(100.0, 100.0)));
-                        });
-                    }
-                    
-                    if response.clicked() {
-                        self.selected_custom_stamp_index = Some(i);
-                        self.selected_stamp_type = StampType::Custom(name.clone());
-                    }
-                }
-
-                ui.separator();
-
-                let btn_text = if self.placing_stamp { "🎯配置中" } else { "配置" };
-                let btn_color = if self.placing_stamp { Color32::from_rgb(100, 200, 100) } else { Color32::GRAY };
+            
+            // 配置ボタン
+            ui.horizontal(|ui| {
+                let btn_text = if self.placing_stamp { "🎯 配置中（クリックで解除）" } else { "📍 スタンプを配置" };
+                let btn_color = if self.placing_stamp { Color32::from_rgb(100, 200, 100) } else { Color32::from_rgb(80, 80, 80) };
                 if ui.add(egui::Button::new(btn_text).fill(btn_color)).clicked() {
                     self.placing_stamp = !self.placing_stamp;
                     self.placing_text = false;
                     self.selected_stamp_index = None;
                     self.selected_text_index = None;
                 }
+                
+                ui.separator();
+                
+                if ui.button("➕ スタンプ登録").clicked() {
+                    result.register_stamp_clicked = true;
+                }
+            });
+            
+            ui.add_space(4.0);
+            
+            // スタンプサムネイルグリッド
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let thumb_size = 50.0;
+                    
+                    // 組み込みスタンプ
+                    let stamp_types = [
+                        (StampType::Approved, "✅", "承認", Color32::GREEN),
+                        (StampType::Rejected, "❌", "却下", Color32::RED),
+                        (StampType::Draft, "📝", "下書", Color32::from_rgb(200, 150, 0)),
+                        (StampType::Confidential, "🔒", "機密", Color32::BLUE),
+                    ];
+
+                    for (stamp_type, icon, label, color) in &stamp_types {
+                        let selected = self.selected_custom_stamp_index.is_none() 
+                            && self.selected_stamp_type == *stamp_type;
+                        
+                        let frame_color = if selected { Color32::YELLOW } else { Color32::from_gray(60) };
+                        
+                        egui::Frame::none()
+                            .fill(Color32::from_gray(40))
+                            .stroke(egui::Stroke::new(if selected { 3.0 } else { 1.0 }, frame_color))
+                            .rounding(4.0)
+                            .inner_margin(4.0)
+                            .show(ui, |ui| {
+                                ui.set_width(thumb_size);
+                                ui.set_height(thumb_size + 16.0);
+                                
+                                let response = ui.vertical_centered(|ui| {
+                                    ui.label(egui::RichText::new(*icon).size(24.0));
+                                    ui.label(egui::RichText::new(*label).size(10.0).color(*color));
+                                });
+                                
+                                if response.response.clicked() {
+                                    self.selected_stamp_type = stamp_type.clone();
+                                    self.selected_custom_stamp_index = None;
+                                }
+                            });
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // カスタムスタンプ
+                    for (i, (name, tex)) in custom_stamps.iter().enumerate() {
+                        let selected = self.selected_custom_stamp_index == Some(i);
+                        let frame_color = if selected { Color32::YELLOW } else { Color32::from_gray(60) };
+                        
+                        egui::Frame::none()
+                            .fill(Color32::from_gray(40))
+                            .stroke(egui::Stroke::new(if selected { 3.0 } else { 1.0 }, frame_color))
+                            .rounding(4.0)
+                            .inner_margin(4.0)
+                            .show(ui, |ui| {
+                                ui.set_width(thumb_size);
+                                ui.set_height(thumb_size + 16.0);
+                                
+                                ui.vertical_centered(|ui| {
+                                    if let Some(texture) = tex {
+                                        ui.image((texture.id(), Vec2::new(thumb_size - 8.0, thumb_size - 8.0)));
+                                    } else {
+                                        ui.label(egui::RichText::new("🖼").size(24.0));
+                                    }
+                                    
+                                    // 短い名前表示
+                                    let short_name: String = name.chars().take(6).collect();
+                                    ui.label(egui::RichText::new(&short_name).size(9.0));
+                                });
+                            })
+                            .response
+                            .context_menu(|ui| {
+                                if ui.button("🗑 削除").clicked() {
+                                    result.delete_custom_stamp = Some(i);
+                                    if self.selected_custom_stamp_index == Some(i) {
+                                        self.selected_custom_stamp_index = None;
+                                        self.selected_stamp_type = StampType::Approved;
+                                    }
+                                    ui.close_menu();
+                                }
+                            });
+                        
+                        // クリックで選択
+                        let last_response = ui.interact(
+                            ui.min_rect(),
+                            egui::Id::new(format!("custom_stamp_{}", i)),
+                            egui::Sense::click(),
+                        );
+                        if last_response.clicked() {
+                            self.selected_custom_stamp_index = Some(i);
+                            self.selected_stamp_type = StampType::Custom(name.clone());
+                        }
+                    }
+                });
             });
         }
 
@@ -269,8 +337,6 @@ impl EditorPanel {
             });
         }
 
-        ui.separator();
-        ui.label("💡 ヒント: クリックで選択、ドラッグで移動、選択後に削除ボタンで削除");
         ui.separator();
 
         // ページテクスチャを更新（ページ変更または回転変更時）
@@ -318,10 +384,10 @@ impl EditorPanel {
                 .filter(|(_, s)| s.page == page_index)
                 .collect();
 
-            // 既存のスタンプを描画（回転変換を適用）
+            // 既存のスタンプを描画（回転変換を適用、サイズは維持）
             for (global_idx, stamp) in &page_stamps {
-                // PDF座標から表示座標に変換
-                let (display_x, display_y, display_w, display_h) = self.pdf_to_display(
+                // PDF座標から表示座標に変換（位置のみ、サイズは維持）
+                let (display_x, display_y) = self.pdf_to_display_pos(
                     stamp.x, stamp.y, stamp.width, stamp.height,
                     orig_w, orig_h, rotation
                 );
@@ -330,7 +396,8 @@ impl EditorPanel {
                     rect.min.x + display_x * self.zoom,
                     rect.min.y + display_y * self.zoom,
                 );
-                let stamp_size = Vec2::new(display_w * self.zoom, display_h * self.zoom);
+                // サイズは元のまま維持
+                let stamp_size = Vec2::new(stamp.width * self.zoom, stamp.height * self.zoom);
                 let stamp_rect = egui::Rect::from_min_size(stamp_pos, stamp_size);
 
                 let is_selected = self.selected_stamp_index == Some(*global_idx);
@@ -386,12 +453,10 @@ impl EditorPanel {
 
             // 既存のテキスト注釈を描画（回転変換を適用）
             for (global_idx, annotation) in &page_texts {
-                // テキストサイズを推定
                 let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
                 let text_height = annotation.font_size;
 
-                // PDF座標から表示座標に変換
-                let (display_x, display_y, _, _) = self.pdf_to_display(
+                let (display_x, display_y) = self.pdf_to_display_pos(
                     annotation.x, annotation.y, text_width, text_height,
                     orig_w, orig_h, rotation
                 );
@@ -403,7 +468,6 @@ impl EditorPanel {
                 
                 let is_selected = self.selected_text_index == Some(*global_idx);
                 
-                // テキストサイズを計算
                 let font = egui::FontId::proportional(annotation.font_size * self.zoom);
                 let galley = ui.painter().layout_no_wrap(
                     annotation.text.clone(),
@@ -412,7 +476,6 @@ impl EditorPanel {
                 );
                 let text_rect = egui::Rect::from_min_size(text_pos, galley.size());
 
-                // 選択時は背景を表示
                 if is_selected {
                     ui.painter().rect_filled(
                         text_rect.expand(2.0),
@@ -431,20 +494,18 @@ impl EditorPanel {
 
             // クリック・ドラッグ処理
             if !self.placing_stamp && !self.placing_text {
-                // スタンプ選択チェック
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let mut found = false;
                         
-                        // スタンプをクリックしたか
                         for (global_idx, stamp) in page_stamps.iter().rev() {
-                            let (display_x, display_y, display_w, display_h) = self.pdf_to_display(
+                            let (display_x, display_y) = self.pdf_to_display_pos(
                                 stamp.x, stamp.y, stamp.width, stamp.height,
                                 orig_w, orig_h, rotation
                             );
                             let stamp_rect = egui::Rect::from_min_size(
                                 egui::pos2(rect.min.x + display_x * self.zoom, rect.min.y + display_y * self.zoom),
-                                Vec2::new(display_w * self.zoom, display_h * self.zoom),
+                                Vec2::new(stamp.width * self.zoom, stamp.height * self.zoom),
                             );
                             if stamp_rect.contains(pos) {
                                 self.selected_stamp_index = Some(*global_idx);
@@ -454,12 +515,11 @@ impl EditorPanel {
                             }
                         }
                         
-                        // テキストをクリックしたか
                         if !found {
                             for (global_idx, annotation) in page_texts.iter().rev() {
                                 let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
                                 let text_height = annotation.font_size;
-                                let (display_x, display_y, _, _) = self.pdf_to_display(
+                                let (display_x, display_y) = self.pdf_to_display_pos(
                                     annotation.x, annotation.y, text_width, text_height,
                                     orig_w, orig_h, rotation
                                 );
@@ -496,7 +556,7 @@ impl EditorPanel {
                     if let Some(pos) = response.interact_pointer_pos() {
                         if let Some(idx) = self.selected_stamp_index {
                             if let Some(stamp) = stamps.get(idx) {
-                                let (display_x, display_y, _, _) = self.pdf_to_display(
+                                let (display_x, display_y) = self.pdf_to_display_pos(
                                     stamp.x, stamp.y, stamp.width, stamp.height,
                                     orig_w, orig_h, rotation
                                 );
@@ -511,7 +571,7 @@ impl EditorPanel {
                             if let Some(annotation) = text_annotations.get(idx) {
                                 let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
                                 let text_height = annotation.font_size;
-                                let (display_x, display_y, _, _) = self.pdf_to_display(
+                                let (display_x, display_y) = self.pdf_to_display_pos(
                                     annotation.x, annotation.y, text_width, text_height,
                                     orig_w, orig_h, rotation
                                 );
@@ -526,7 +586,6 @@ impl EditorPanel {
                     }
                 }
 
-                // ドラッグ中
                 if response.dragged() && self.dragging {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
@@ -534,21 +593,13 @@ impl EditorPanel {
                 // ドラッグ終了
                 if response.drag_stopped() && self.dragging {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        // 表示座標を計算
                         let display_x = (pos.x - rect.min.x - self.drag_offset.x) / self.zoom;
                         let display_y = (pos.y - rect.min.y - self.drag_offset.y) / self.zoom;
                         
                         if let Some(idx) = self.selected_stamp_index {
                             if let Some(stamp) = stamps.get(idx) {
-                                // 回転に応じてサイズを調整
-                                let (w, h) = if rotation == 90 || rotation == 270 {
-                                    (stamp.height, stamp.width)
-                                } else {
-                                    (stamp.width, stamp.height)
-                                };
-                                // 表示座標からPDF座標に変換
                                 let (pdf_x, pdf_y) = self.display_to_pdf(
-                                    display_x, display_y, w, h,
+                                    display_x, display_y, stamp.width, stamp.height,
                                     orig_w, orig_h, rotation
                                 );
                                 result.move_stamp = Some((idx, pdf_x, pdf_y));
@@ -557,7 +608,6 @@ impl EditorPanel {
                             if let Some(annotation) = text_annotations.get(idx) {
                                 let text_width = annotation.text.len() as f32 * annotation.font_size * 0.6;
                                 let text_height = annotation.font_size;
-                                // 表示座標からPDF座標に変換
                                 let (pdf_x, pdf_y) = self.display_to_pdf(
                                     display_x, display_y, text_width, text_height,
                                     orig_w, orig_h, rotation
@@ -614,11 +664,9 @@ impl EditorPanel {
 
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        // 表示座標を計算（中央配置のため半分引く）
                         let display_x = (pos.x - rect.min.x) / self.zoom - 50.0;
                         let display_y = (pos.y - rect.min.y) / self.zoom - 25.0;
 
-                        // 表示座標からPDF座標に変換
                         let (pdf_x, pdf_y) = self.display_to_pdf(
                             display_x, display_y, 100.0, 50.0,
                             orig_w, orig_h, rotation
@@ -654,14 +702,12 @@ impl EditorPanel {
 
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        // 表示座標を計算
                         let display_x = (pos.x - rect.min.x) / self.zoom;
                         let display_y = (pos.y - rect.min.y) / self.zoom;
 
                         let text_width = self.text_input.len() as f32 * self.text_font_size * 0.6;
                         let text_height = self.text_font_size;
 
-                        // 表示座標からPDF座標に変換
                         let (pdf_x, pdf_y) = self.display_to_pdf(
                             display_x, display_y, text_width, text_height,
                             orig_w, orig_h, rotation
@@ -699,12 +745,10 @@ impl EditorPanel {
         result
     }
 
-    /// ページキャッシュを無効化
     fn invalidate_page_cache(&mut self) {
         self.page_texture = None;
     }
 
-    /// 外部からキャッシュを無効化
     pub fn invalidate_cache(&mut self) {
         self.invalidate_page_cache();
     }
