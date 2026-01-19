@@ -4,18 +4,14 @@ use crate::pdf::{PdfDocument, Stamp, StampType, TextAnnotation};
 use eframe::egui::{self, Color32, TextureHandle, Vec2};
 
 /// エディター操作の結果
+#[derive(Default)]
 pub struct EditorResult {
     pub new_stamp: Option<Stamp>,
     pub new_text: Option<TextAnnotation>,
-}
-
-impl Default for EditorResult {
-    fn default() -> Self {
-        Self {
-            new_stamp: None,
-            new_text: None,
-        }
-    }
+    pub delete_stamp: Option<usize>,
+    pub delete_text: Option<usize>,
+    pub move_stamp: Option<(usize, f32, f32)>,
+    pub move_text: Option<(usize, f32, f32)>,
 }
 
 /// エディターパネルの状態
@@ -36,6 +32,12 @@ pub struct EditorPanel {
     text_input: String,
     text_font_size: f32,
     placing_text: bool,
+
+    // 選択・ドラッグ
+    selected_stamp_index: Option<usize>,
+    selected_text_index: Option<usize>,
+    dragging: bool,
+    drag_offset: Vec2,
 }
 
 impl EditorPanel {
@@ -50,30 +52,11 @@ impl EditorPanel {
             text_input: String::new(),
             text_font_size: 14.0,
             placing_text: false,
+            selected_stamp_index: None,
+            selected_text_index: None,
+            dragging: false,
+            drag_offset: Vec2::ZERO,
         }
-    }
-
-    /// UIを描画
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        doc: &PdfDocument,
-        page_index: usize,
-        stamps: &[Stamp],
-        text_annotations: &[TextAnnotation],
-        show_stamp_panel: bool,
-        show_text_panel: bool,
-    ) -> EditorResult {
-        self.show_with_custom_stamps(
-            ui,
-            doc,
-            page_index,
-            stamps,
-            text_annotations,
-            show_stamp_panel,
-            show_text_panel,
-            &[],
-        )
     }
 
     /// カスタムスタンプ付きでUIを描画
@@ -106,6 +89,29 @@ impl EditorPanel {
                 self.zoom = 1.0;
                 self.invalidate_page_cache();
             }
+            
+            ui.separator();
+            
+            // 選択中のアイテム情報と削除ボタン
+            if let Some(idx) = self.selected_stamp_index {
+                ui.label(format!("スタンプ#{} 選択中", idx + 1));
+                if ui.button("🗑 削除").clicked() {
+                    result.delete_stamp = Some(idx);
+                    self.selected_stamp_index = None;
+                }
+                if ui.button("✕ 選択解除").clicked() {
+                    self.selected_stamp_index = None;
+                }
+            } else if let Some(idx) = self.selected_text_index {
+                ui.label(format!("テキスト#{} 選択中", idx + 1));
+                if ui.button("🗑 削除").clicked() {
+                    result.delete_text = Some(idx);
+                    self.selected_text_index = None;
+                }
+                if ui.button("✕ 選択解除").clicked() {
+                    self.selected_text_index = None;
+                }
+            }
         });
 
         // スタンプパネル
@@ -114,7 +120,6 @@ impl EditorPanel {
             ui.horizontal_wrapped(|ui| {
                 ui.label("スタンプ:");
                 
-                // 組み込みスタンプ
                 let stamp_types = [
                     (StampType::Approved, "✅承認"),
                     (StampType::Rejected, "❌却下"),
@@ -131,12 +136,10 @@ impl EditorPanel {
                     }
                 }
 
-                // カスタムスタンプ
                 for (i, (name, tex)) in custom_stamps.iter().enumerate() {
                     let selected = self.selected_custom_stamp_index == Some(i);
                     let response = ui.selectable_label(selected, format!("🖼{}", name));
                     
-                    // ツールチップでプレビュー表示
                     if let Some(texture) = tex {
                         response.clone().on_hover_ui(|ui| {
                             ui.image((texture.id(), Vec2::new(100.0, 100.0)));
@@ -151,10 +154,13 @@ impl EditorPanel {
 
                 ui.separator();
 
-                let btn_text = if self.placing_stamp { "🎯配置中（クリックで確定）" } else { "配置モード" };
-                if ui.button(btn_text).clicked() {
+                let btn_text = if self.placing_stamp { "🎯配置中" } else { "配置" };
+                let btn_color = if self.placing_stamp { Color32::from_rgb(100, 200, 100) } else { Color32::GRAY };
+                if ui.add(egui::Button::new(btn_text).fill(btn_color)).clicked() {
                     self.placing_stamp = !self.placing_stamp;
                     self.placing_text = false;
+                    self.selected_stamp_index = None;
+                    self.selected_text_index = None;
                 }
             });
         }
@@ -169,19 +175,26 @@ impl EditorPanel {
                 ui.add(egui::DragValue::new(&mut self.text_font_size).range(8.0..=72.0));
 
                 let btn_text = if self.placing_text { "🎯配置中" } else { "配置" };
-                if ui.button(btn_text).clicked() && !self.text_input.is_empty() {
+                let btn_color = if self.placing_text { Color32::from_rgb(100, 200, 100) } else { Color32::GRAY };
+                if ui.add(egui::Button::new(btn_text).fill(btn_color)).clicked() && !self.text_input.is_empty() {
                     self.placing_text = !self.placing_text;
                     self.placing_stamp = false;
+                    self.selected_stamp_index = None;
+                    self.selected_text_index = None;
                 }
             });
         }
 
+        ui.separator();
+        ui.label("💡 ヒント: クリックで選択、ドラッグで移動、選択後に削除ボタンで削除");
         ui.separator();
 
         // ページテクスチャを更新
         if self.current_page_index != Some(page_index) {
             self.current_page_index = Some(page_index);
             self.page_texture = None;
+            self.selected_stamp_index = None;
+            self.selected_text_index = None;
         }
 
         // ページサイズ計算
@@ -203,7 +216,7 @@ impl EditorPanel {
         // ページ描画
         if let Some(ref texture) = self.page_texture {
             let size = Vec2::new(render_width as f32, render_height as f32);
-            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
 
             // ページ画像描画
             ui.painter().image(
@@ -213,8 +226,15 @@ impl EditorPanel {
                 Color32::WHITE,
             );
 
+            // 現在のページのスタンプをフィルタ
+            let page_stamps: Vec<(usize, &Stamp)> = stamps
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.page == page_index)
+                .collect();
+
             // 既存のスタンプを描画
-            for stamp in stamps.iter().filter(|s| s.page == page_index) {
+            for (global_idx, stamp) in &page_stamps {
                 let stamp_pos = egui::pos2(
                     rect.min.x + stamp.x * self.zoom,
                     rect.min.y + stamp.y * self.zoom,
@@ -222,25 +242,16 @@ impl EditorPanel {
                 let stamp_size = Vec2::new(stamp.width * self.zoom, stamp.height * self.zoom);
                 let stamp_rect = egui::Rect::from_min_size(stamp_pos, stamp_size);
 
-                // カスタムスタンプの場合はテクスチャを表示
+                let is_selected = self.selected_stamp_index == Some(*global_idx);
+
+                // カスタムスタンプの場合
                 if let StampType::Custom(ref name) = stamp.stamp_type {
-                    // カスタムスタンプを探す
                     if let Some((_, Some(tex))) = custom_stamps.iter().find(|(n, _)| n == name) {
                         ui.painter().image(
                             tex.id(),
                             stamp_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             Color32::WHITE,
-                        );
-                    } else {
-                        // テクスチャがない場合は枠だけ
-                        ui.painter().rect_stroke(stamp_rect, 4.0, egui::Stroke::new(2.0, Color32::GRAY));
-                        ui.painter().text(
-                            stamp_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            name,
-                            egui::FontId::proportional(12.0 * self.zoom),
-                            Color32::GRAY,
                         );
                     }
                 } else {
@@ -264,43 +275,174 @@ impl EditorPanel {
                         border_color,
                     );
                 }
+
+                // 選択枠
+                if is_selected {
+                    ui.painter().rect_stroke(
+                        stamp_rect.expand(3.0),
+                        4.0,
+                        egui::Stroke::new(3.0, Color32::YELLOW),
+                    );
+                }
             }
 
+            // 現在のページのテキストをフィルタ
+            let page_texts: Vec<(usize, &TextAnnotation)> = text_annotations
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.page == page_index)
+                .collect();
+
             // 既存のテキスト注釈を描画
-            for annotation in text_annotations.iter().filter(|a| a.page == page_index) {
+            for (global_idx, annotation) in &page_texts {
                 let text_pos = egui::pos2(
                     rect.min.x + annotation.x * self.zoom,
                     rect.min.y + annotation.y * self.zoom,
                 );
-                ui.painter().text(
-                    text_pos,
-                    egui::Align2::LEFT_TOP,
-                    &annotation.text,
-                    egui::FontId::proportional(annotation.font_size * self.zoom),
+                
+                let is_selected = self.selected_text_index == Some(*global_idx);
+                
+                // テキストサイズを計算（おおよそ）
+                let font = egui::FontId::proportional(annotation.font_size * self.zoom);
+                let galley = ui.painter().layout_no_wrap(
+                    annotation.text.clone(),
+                    font.clone(),
                     Color32::BLACK,
                 );
+                let text_rect = egui::Rect::from_min_size(text_pos, galley.size());
+
+                // 選択時は背景を表示
+                if is_selected {
+                    ui.painter().rect_filled(
+                        text_rect.expand(2.0),
+                        2.0,
+                        Color32::from_rgba_unmultiplied(255, 255, 0, 100),
+                    );
+                    ui.painter().rect_stroke(
+                        text_rect.expand(2.0),
+                        2.0,
+                        egui::Stroke::new(2.0, Color32::YELLOW),
+                    );
+                }
+
+                ui.painter().galley(text_pos, galley, Color32::BLACK);
             }
 
-            // スタンプ配置モード - マウス追従プレビュー
+            // クリック・ドラッグ処理
+            if !self.placing_stamp && !self.placing_text {
+                // スタンプ選択チェック
+                if response.clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let mut found = false;
+                        
+                        // スタンプをクリックしたか
+                        for (global_idx, stamp) in page_stamps.iter().rev() {
+                            let stamp_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x + stamp.x * self.zoom, rect.min.y + stamp.y * self.zoom),
+                                Vec2::new(stamp.width * self.zoom, stamp.height * self.zoom),
+                            );
+                            if stamp_rect.contains(pos) {
+                                self.selected_stamp_index = Some(*global_idx);
+                                self.selected_text_index = None;
+                                found = true;
+                                break;
+                            }
+                        }
+                        
+                        // テキストをクリックしたか
+                        if !found {
+                            for (global_idx, annotation) in page_texts.iter().rev() {
+                                let text_pos = egui::pos2(
+                                    rect.min.x + annotation.x * self.zoom,
+                                    rect.min.y + annotation.y * self.zoom,
+                                );
+                                let font = egui::FontId::proportional(annotation.font_size * self.zoom);
+                                let galley = ui.painter().layout_no_wrap(
+                                    annotation.text.clone(),
+                                    font,
+                                    Color32::BLACK,
+                                );
+                                let text_rect = egui::Rect::from_min_size(text_pos, galley.size());
+                                
+                                if text_rect.contains(pos) {
+                                    self.selected_text_index = Some(*global_idx);
+                                    self.selected_stamp_index = None;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if !found {
+                            self.selected_stamp_index = None;
+                            self.selected_text_index = None;
+                        }
+                    }
+                }
+
+                // ドラッグ開始
+                if response.drag_started() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        if let Some(idx) = self.selected_stamp_index {
+                            if let Some(stamp) = stamps.get(idx) {
+                                let stamp_pos = egui::pos2(
+                                    rect.min.x + stamp.x * self.zoom,
+                                    rect.min.y + stamp.y * self.zoom,
+                                );
+                                self.drag_offset = Vec2::new(pos.x - stamp_pos.x, pos.y - stamp_pos.y);
+                                self.dragging = true;
+                            }
+                        } else if let Some(idx) = self.selected_text_index {
+                            if let Some(annotation) = text_annotations.get(idx) {
+                                let text_pos = egui::pos2(
+                                    rect.min.x + annotation.x * self.zoom,
+                                    rect.min.y + annotation.y * self.zoom,
+                                );
+                                self.drag_offset = Vec2::new(pos.x - text_pos.x, pos.y - text_pos.y);
+                                self.dragging = true;
+                            }
+                        }
+                    }
+                }
+
+                // ドラッグ中
+                if response.dragged() && self.dragging {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+
+                // ドラッグ終了
+                if response.drag_stopped() && self.dragging {
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        let new_x = (pos.x - rect.min.x - self.drag_offset.x) / self.zoom;
+                        let new_y = (pos.y - rect.min.y - self.drag_offset.y) / self.zoom;
+                        
+                        if let Some(idx) = self.selected_stamp_index {
+                            result.move_stamp = Some((idx, new_x, new_y));
+                        } else if let Some(idx) = self.selected_text_index {
+                            result.move_text = Some((idx, new_x, new_y));
+                        }
+                    }
+                    self.dragging = false;
+                }
+            }
+
+            // スタンプ配置モード
             if self.placing_stamp {
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if rect.contains(hover_pos) {
                         let preview_size = Vec2::new(100.0 * self.zoom, 50.0 * self.zoom);
                         let preview_rect = egui::Rect::from_center_size(hover_pos, preview_size);
                         
-                        // カスタムスタンプのプレビュー
                         if let Some(idx) = self.selected_custom_stamp_index {
                             if let Some((_, Some(tex))) = custom_stamps.get(idx) {
-                                // 透過付きで表示
                                 ui.painter().image(
                                     tex.id(),
                                     preview_rect,
                                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 150),
                                 );
                             }
                         } else {
-                            // 組み込みスタンプのプレビュー
                             let (bg_color, border_color) = match &self.selected_stamp_type {
                                 StampType::Approved => (Color32::from_rgba_unmultiplied(200, 255, 200, 100), Color32::from_rgba_unmultiplied(0, 200, 0, 150)),
                                 StampType::Rejected => (Color32::from_rgba_unmultiplied(255, 200, 200, 100), Color32::from_rgba_unmultiplied(200, 0, 0, 150)),
@@ -321,21 +463,19 @@ impl EditorPanel {
                             );
                         }
                         
-                        // カーソルを変更
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                     }
                 }
 
-                // クリックでスタンプ配置
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        let pdf_x = (pos.x - rect.min.x) / self.zoom;
-                        let pdf_y = (pos.y - rect.min.y) / self.zoom;
+                        let pdf_x = (pos.x - rect.min.x) / self.zoom - 50.0;
+                        let pdf_y = (pos.y - rect.min.y) / self.zoom - 25.0;
 
                         result.new_stamp = Some(Stamp {
                             page: page_index,
-                            x: pdf_x - 50.0, // 中央配置
-                            y: pdf_y - 25.0,
+                            x: pdf_x,
+                            y: pdf_y,
                             width: 100.0,
                             height: 50.0,
                             stamp_type: self.selected_stamp_type.clone(),
@@ -349,7 +489,6 @@ impl EditorPanel {
             if self.placing_text {
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if rect.contains(hover_pos) {
-                        // テキストプレビュー
                         ui.painter().text(
                             hover_pos,
                             egui::Align2::LEFT_TOP,
@@ -378,6 +517,18 @@ impl EditorPanel {
                     }
                 }
             }
+
+            // Deleteキーで削除
+            if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                if let Some(idx) = self.selected_stamp_index {
+                    result.delete_stamp = Some(idx);
+                    self.selected_stamp_index = None;
+                } else if let Some(idx) = self.selected_text_index {
+                    result.delete_text = Some(idx);
+                    self.selected_text_index = None;
+                }
+            }
+
         } else {
             ui.spinner();
             ui.label("読み込み中...");

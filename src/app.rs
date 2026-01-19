@@ -1,8 +1,9 @@
 //! アプリケーションの状態管理
 
-use crate::pdf::{PdfDocument, PdfOperations, Stamp, StampType, TextAnnotation};
+use crate::pdf::{PdfDocument, PdfOperations, Stamp, TextAnnotation};
 use crate::ui::{EditorPanel, FileExplorer};
 use eframe::egui::{self, Color32, TextureHandle, Vec2};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::SystemTime;
@@ -56,6 +57,13 @@ struct FolderPdfEntry {
     modified: SystemTime,
 }
 
+/// 注釈データ（保存用）
+#[derive(Serialize, Deserialize)]
+struct AnnotationData {
+    stamps: Vec<Stamp>,
+    texts: Vec<TextAnnotation>,
+}
+
 /// カスタムスタンプ（PNG透過対応）
 #[derive(Clone)]
 pub struct CustomStamp {
@@ -99,14 +107,18 @@ impl PdfViewerApp {
     pub fn open_pdf(&mut self, path: PathBuf) {
         match PdfDocument::open(&path) {
             Ok(doc) => {
-                self.status_message = format!("開きました: {}", path.display());
                 self.current_document = Some(doc);
-                self.current_pdf_path = Some(path);
+                self.current_pdf_path = Some(path.clone());
                 self.selected_page = 0;
+                self.editor_panel.invalidate_cache();
+                
+                // 注釈ファイルを読み込み
                 self.stamps.clear();
                 self.text_annotations.clear();
+                self.load_annotations(&path);
+                
                 self.has_unsaved_changes = false;
-                self.editor_panel.invalidate_cache();
+                self.status_message = format!("開きました: {}", path.display());
             }
             Err(e) => {
                 self.status_message = format!("エラー: {}", e);
@@ -115,12 +127,49 @@ impl PdfViewerApp {
         }
     }
 
-    /// 上書き保存
+    /// 上書き保存（注釈を保存）
     fn save_current(&mut self) {
         if let Some(ref path) = self.current_pdf_path.clone() {
-            self.save_pdf(path);
+            self.save_annotations(&path);
+            self.has_unsaved_changes = false;
+            self.status_message = format!("保存しました: {}", path.display());
         } else {
             self.status_message = "保存先が指定されていません".to_string();
+        }
+    }
+
+    /// 注釈ファイルのパスを取得
+    fn get_annotations_path(pdf_path: &PathBuf) -> PathBuf {
+        let mut path = pdf_path.clone();
+        path.set_extension("annotations.json");
+        path
+    }
+
+    /// 注釈を読み込み
+    fn load_annotations(&mut self, pdf_path: &PathBuf) {
+        let ann_path = Self::get_annotations_path(pdf_path);
+        if ann_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&ann_path) {
+                if let Ok(data) = serde_json::from_str::<AnnotationData>(&content) {
+                    self.stamps = data.stamps;
+                    self.text_annotations = data.texts;
+                    self.status_message = format!("注釈を読み込みました");
+                }
+            }
+        }
+    }
+
+    /// 注釈を保存
+    fn save_annotations(&self, pdf_path: &PathBuf) {
+        let ann_path = Self::get_annotations_path(pdf_path);
+        let data = AnnotationData {
+            stamps: self.stamps.clone(),
+            texts: self.text_annotations.clone(),
+        };
+        if let Ok(content) = serde_json::to_string_pretty(&data) {
+            if let Err(e) = std::fs::write(&ann_path, content) {
+                log::error!("注釈の保存に失敗: {}", e);
+            }
         }
     }
 
@@ -653,6 +702,10 @@ impl eframe::App for PdfViewerApp {
                     // プレビュー
                     let mut new_stamp = None;
                     let mut new_text = None;
+                    let mut delete_stamp = None;
+                    let mut delete_text = None;
+                    let mut move_stamp = None;
+                    let mut move_text = None;
                     
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
@@ -670,16 +723,56 @@ impl eframe::App for PdfViewerApp {
                                 );
                                 new_stamp = editor_result.new_stamp;
                                 new_text = editor_result.new_text;
+                                delete_stamp = editor_result.delete_stamp;
+                                delete_text = editor_result.delete_text;
+                                move_stamp = editor_result.move_stamp;
+                                move_text = editor_result.move_text;
                             }
                         });
 
+                    // スタンプ追加
                     if let Some(stamp) = new_stamp {
                         self.stamps.push(stamp);
                         self.has_unsaved_changes = true;
+                        self.status_message = "スタンプを追加しました".to_string();
                     }
+                    // テキスト追加
                     if let Some(annotation) = new_text {
                         self.text_annotations.push(annotation);
                         self.has_unsaved_changes = true;
+                        self.status_message = "テキストを追加しました".to_string();
+                    }
+                    // スタンプ削除
+                    if let Some(idx) = delete_stamp {
+                        if idx < self.stamps.len() {
+                            self.stamps.remove(idx);
+                            self.has_unsaved_changes = true;
+                            self.status_message = "スタンプを削除しました".to_string();
+                        }
+                    }
+                    // テキスト削除
+                    if let Some(idx) = delete_text {
+                        if idx < self.text_annotations.len() {
+                            self.text_annotations.remove(idx);
+                            self.has_unsaved_changes = true;
+                            self.status_message = "テキストを削除しました".to_string();
+                        }
+                    }
+                    // スタンプ移動
+                    if let Some((idx, new_x, new_y)) = move_stamp {
+                        if idx < self.stamps.len() {
+                            self.stamps[idx].x = new_x;
+                            self.stamps[idx].y = new_y;
+                            self.has_unsaved_changes = true;
+                        }
+                    }
+                    // テキスト移動
+                    if let Some((idx, new_x, new_y)) = move_text {
+                        if idx < self.text_annotations.len() {
+                            self.text_annotations[idx].x = new_x;
+                            self.text_annotations[idx].y = new_y;
+                            self.has_unsaved_changes = true;
+                        }
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
