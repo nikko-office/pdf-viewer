@@ -134,6 +134,7 @@ impl EditorPanel {
     }
 
     /// カスタムスタンプ付きでUIを描画
+    /// custom_stamps: (名前, テクスチャ, 幅, 高さ)
     pub fn show_with_custom_stamps(
         &mut self,
         ui: &mut egui::Ui,
@@ -143,7 +144,7 @@ impl EditorPanel {
         text_annotations: &[TextAnnotation],
         show_stamp_panel: bool,
         show_text_panel: bool,
-        custom_stamps: &[(String, Option<TextureHandle>)],
+        custom_stamps: &[(String, Option<TextureHandle>, u32, u32)],
     ) -> EditorResult {
         let mut result = EditorResult::default();
 
@@ -265,9 +266,17 @@ impl EditorPanel {
                     ui.add_space(8.0);
 
                     // カスタムスタンプ
-                    for (i, (name, tex)) in custom_stamps.iter().enumerate() {
+                    for (i, (name, tex, w, h)) in custom_stamps.iter().enumerate() {
                         let selected = self.selected_custom_stamp_index == Some(i);
                         let frame_color = if selected { Color32::YELLOW } else { Color32::from_gray(60) };
+                        
+                        // サムネイルサイズを比率維持で計算
+                        let aspect = *w as f32 / (*h as f32).max(1.0);
+                        let (thumb_w, thumb_h) = if aspect > 1.0 {
+                            (thumb_size - 8.0, (thumb_size - 8.0) / aspect)
+                        } else {
+                            ((thumb_size - 8.0) * aspect, thumb_size - 8.0)
+                        };
                         
                         egui::Frame::none()
                             .fill(Color32::from_gray(40))
@@ -280,7 +289,7 @@ impl EditorPanel {
                                 
                                 ui.vertical_centered(|ui| {
                                     if let Some(texture) = tex {
-                                        ui.image((texture.id(), Vec2::new(thumb_size - 8.0, thumb_size - 8.0)));
+                                        ui.image((texture.id(), Vec2::new(thumb_w, thumb_h)));
                                     } else {
                                         ui.label(egui::RichText::new("🖼").size(24.0));
                                     }
@@ -404,7 +413,7 @@ impl EditorPanel {
 
                 // カスタムスタンプの場合
                 if let StampType::Custom(ref name) = stamp.stamp_type {
-                    if let Some((_, Some(tex))) = custom_stamps.iter().find(|(n, _)| n == name) {
+                    if let Some((_, Some(tex), _, _)) = custom_stamps.iter().find(|(n, _, _, _)| n == name) {
                         ui.painter().image(
                             tex.id(),
                             stamp_rect,
@@ -622,14 +631,28 @@ impl EditorPanel {
 
             // スタンプ配置モード
             if self.placing_stamp {
+                // カスタムスタンプの場合、元のサイズを使用（スケール調整）
+                let (stamp_w, stamp_h) = if let Some(idx) = self.selected_custom_stamp_index {
+                    if let Some((_, _, w, h)) = custom_stamps.get(idx) {
+                        // 最大100ピクセル幅にスケーリング、比率維持
+                        let max_size = 100.0;
+                        let scale = max_size / (*w as f32).max(*h as f32);
+                        (*w as f32 * scale, *h as f32 * scale)
+                    } else {
+                        (100.0, 50.0)
+                    }
+                } else {
+                    (100.0, 50.0) // 組み込みスタンプは固定サイズ
+                };
+
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if rect.contains(hover_pos) {
-                        let preview_w = 100.0 * self.zoom;
-                        let preview_h = 50.0 * self.zoom;
+                        let preview_w = stamp_w * self.zoom;
+                        let preview_h = stamp_h * self.zoom;
                         let preview_rect = egui::Rect::from_center_size(hover_pos, Vec2::new(preview_w, preview_h));
                         
                         if let Some(idx) = self.selected_custom_stamp_index {
-                            if let Some((_, Some(tex))) = custom_stamps.get(idx) {
+                            if let Some((_, Some(tex), _, _)) = custom_stamps.get(idx) {
                                 ui.painter().image(
                                     tex.id(),
                                     preview_rect,
@@ -664,11 +687,11 @@ impl EditorPanel {
 
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        let display_x = (pos.x - rect.min.x) / self.zoom - 50.0;
-                        let display_y = (pos.y - rect.min.y) / self.zoom - 25.0;
+                        let display_x = (pos.x - rect.min.x) / self.zoom - stamp_w / 2.0;
+                        let display_y = (pos.y - rect.min.y) / self.zoom - stamp_h / 2.0;
 
                         let (pdf_x, pdf_y) = self.display_to_pdf(
-                            display_x, display_y, 100.0, 50.0,
+                            display_x, display_y, stamp_w, stamp_h,
                             orig_w, orig_h, rotation
                         );
 
@@ -676,8 +699,8 @@ impl EditorPanel {
                             page: page_index,
                             x: pdf_x,
                             y: pdf_y,
-                            width: 100.0,
-                            height: 50.0,
+                            width: stamp_w,
+                            height: stamp_h,
                             stamp_type: self.selected_stamp_type.clone(),
                         });
                         self.placing_stamp = false;

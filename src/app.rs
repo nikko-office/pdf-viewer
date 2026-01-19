@@ -633,12 +633,13 @@ impl eframe::App for PdfViewerApp {
             let _ = self.get_custom_stamp_texture(ctx, i);
         }
         
-        let custom_stamp_info: Vec<(String, Option<TextureHandle>)> = self.custom_stamps
+        // カスタムスタンプ情報（名前, テクスチャ, 幅, 高さ）
+        let custom_stamp_info: Vec<(String, Option<TextureHandle>, u32, u32)> = self.custom_stamps
             .iter()
             .enumerate()
             .map(|(i, s)| {
                 let tex = self.custom_stamp_textures.get(i).and_then(|t| t.clone());
-                (s.name.clone(), tex)
+                (s.name.clone(), tex, s.width, s.height)
             })
             .collect();
         
