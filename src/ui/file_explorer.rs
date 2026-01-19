@@ -9,6 +9,7 @@ pub struct FileExplorer {
     current_dir: PathBuf,
     entries: Vec<FileEntry>,
     error_message: Option<String>,
+    last_selected_folder: Option<PathBuf>,
 }
 
 /// ファイル/ディレクトリエントリ
@@ -27,6 +28,7 @@ impl FileExplorer {
             current_dir: current_dir.clone(),
             entries: Vec::new(),
             error_message: None,
+            last_selected_folder: None,
         };
         explorer.refresh();
         explorer
@@ -96,22 +98,24 @@ impl FileExplorer {
         }
     }
 
-    /// UIを描画し、選択されたPDFファイルのパスを返す
-    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
-        let mut selected_file = None;
+    /// UIを描画し、選択されたパスと種類(folder/file)を返す
+    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<(PathBuf, bool)> {
+        let mut result = None;
 
         // パスナビゲーション
         ui.horizontal(|ui| {
             if ui.button("⬆").on_hover_text("上のフォルダへ").clicked() {
                 self.go_up();
+                result = Some((self.current_dir.clone(), true));
             }
             if ui.button("🔄").on_hover_text("更新").clicked() {
                 self.refresh();
             }
             if ui.button("🏠").on_hover_text("ホームへ").clicked() {
                 if let Some(home) = dirs::home_dir() {
-                    self.current_dir = home;
+                    self.current_dir = home.clone();
                     self.refresh();
+                    result = Some((home, true));
                 }
             }
         });
@@ -139,6 +143,7 @@ impl FileExplorer {
                         if ui.selectable_label(is_current, format!("{}:", drive)).clicked() {
                             self.current_dir = PathBuf::from(&drive_path);
                             self.refresh();
+                            result = Some((self.current_dir.clone(), true));
                         }
                     }
                 }
@@ -159,14 +164,23 @@ impl FileExplorer {
                     let icon = if entry.is_dir { "📁" } else { "📄" };
                     let label = format!("{} {}", icon, entry.name);
 
-                    let response = ui.selectable_label(false, &label);
+                    let is_selected = entry.is_dir
+                        && self.last_selected_folder.as_ref() == Some(&entry.path);
+
+                    let response = ui.selectable_label(is_selected, &label);
 
                     if response.clicked() {
                         if entry.is_dir {
-                            self.navigate_to(&entry.path);
+                            self.last_selected_folder = Some(entry.path.clone());
+                            result = Some((entry.path.clone(), true));
                         } else {
-                            selected_file = Some(entry.path.clone());
+                            result = Some((entry.path.clone(), false));
                         }
+                    }
+
+                    if response.double_clicked() && entry.is_dir {
+                        self.navigate_to(&entry.path);
+                        result = Some((self.current_dir.clone(), true));
                     }
 
                     // ホバー時にファイルサイズを表示
@@ -176,7 +190,7 @@ impl FileExplorer {
                 }
             });
 
-        selected_file
+        result
     }
 }
 

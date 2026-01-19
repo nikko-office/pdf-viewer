@@ -40,7 +40,7 @@ impl ThumbnailPanel {
     pub fn new() -> Self {
         Self {
             thumbnails: Vec::new(),
-            thumbnail_size: Vec2::new(150.0, 200.0),
+            thumbnail_size: Vec2::new(120.0, 160.0),
             drag_state: None,
             context_menu_page: None,
         }
@@ -52,7 +52,86 @@ impl ThumbnailPanel {
         self.thumbnails.resize(doc.page_count(), None);
     }
 
-    /// UIを描画
+    /// 水平方向のサムネイル表示（プレビューパネル下部用）
+    pub fn show_horizontal(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &PdfDocument,
+        selected_page: usize,
+    ) -> ThumbnailResult {
+        let mut result = ThumbnailResult::default();
+        let page_count = doc.page_count();
+
+        if page_count == 0 {
+            return result;
+        }
+
+        // サムネイル数を調整
+        if self.thumbnails.len() != page_count {
+            self.thumbnails.resize(page_count, None);
+        }
+
+        let thumb_size = Vec2::new(80.0, 100.0);
+
+        for i in 0..page_count {
+            let is_selected = i == selected_page;
+
+            let frame_color = if is_selected {
+                Color32::from_rgb(100, 149, 237)
+            } else {
+                Color32::from_gray(60)
+            };
+
+            egui::Frame::none()
+                .fill(Color32::from_gray(40))
+                .stroke(egui::Stroke::new(
+                    if is_selected { 2.0 } else { 1.0 },
+                    frame_color,
+                ))
+                .rounding(2.0)
+                .inner_margin(2.0)
+                .show(ui, |ui: &mut egui::Ui| {
+                    let (rect, response) = ui.allocate_exact_size(thumb_size, egui::Sense::click());
+
+                    // サムネイル描画
+                    if let Some(ref texture) = self.thumbnails[i] {
+                        ui.painter().image(
+                            texture.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(50));
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", i + 1),
+                            egui::FontId::proportional(12.0),
+                            Color32::WHITE,
+                        );
+
+                        // サムネイルをレンダリング
+                        if let Some(image) = doc.render_page_thumbnail(i, 80, 100) {
+                            let texture = ui.ctx().load_texture(
+                                format!("h_thumb_{}", i),
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.thumbnails[i] = Some(texture);
+                        }
+                    }
+
+                    if response.clicked() {
+                        result.selected_page = Some(i);
+                    }
+                });
+        }
+
+        result
+    }
+
+    /// 垂直方向のサムネイル表示（従来の表示）
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -138,7 +217,7 @@ impl ThumbnailPanel {
                                     );
 
                                     // サムネイルをレンダリング
-                                    if let Some(image) = doc.render_page_thumbnail(i, 150, 200) {
+                                    if let Some(image) = doc.render_page_thumbnail(i, 120, 160) {
                                         let texture = ui.ctx().load_texture(
                                             format!("thumbnail_{}", i),
                                             image,

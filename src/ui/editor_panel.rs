@@ -340,4 +340,9 @@ impl EditorPanel {
     fn invalidate_page_cache(&mut self) {
         self.page_texture = None;
     }
+
+    /// 外部からキャッシュを無効化
+    pub fn invalidate_cache(&mut self) {
+        self.invalidate_page_cache();
+    }
 }

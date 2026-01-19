@@ -2,7 +2,7 @@
 
 use crate::pdf::{PdfDocument, PdfOperations, Stamp, TextAnnotation};
 use crate::ui::{EditorPanel, FileExplorer, ThumbnailPanel};
-use eframe::egui;
+use eframe::egui::{self, Color32, TextureHandle, Vec2};
 use std::path::PathBuf;
 
 /// アプリケーション全体の状態
@@ -28,9 +28,20 @@ pub struct PdfViewerApp {
     show_text_panel: bool,
     split_start_page: String,
     split_end_page: String,
-    
+
+    // フォルダ内PDFサムネイル
+    folder_pdfs: Vec<FolderPdfEntry>,
+    selected_pdf_index: Option<usize>,
+    pdf_thumbnails: Vec<Option<TextureHandle>>,
+
     // ステータスメッセージ
     status_message: String,
+}
+
+/// フォルダ内のPDFエントリ
+struct FolderPdfEntry {
+    path: PathBuf,
+    name: String,
 }
 
 impl PdfViewerApp {
@@ -50,6 +61,9 @@ impl PdfViewerApp {
             show_text_panel: false,
             split_start_page: String::new(),
             split_end_page: String::new(),
+            folder_pdfs: Vec::new(),
+            selected_pdf_index: None,
+            pdf_thumbnails: Vec::new(),
             status_message: "準備完了".to_string(),
         }
     }
@@ -70,10 +84,30 @@ impl PdfViewerApp {
         }
     }
 
+    /// フォルダ内のPDFを更新
+    pub fn update_folder_pdfs(&mut self, folder_path: &PathBuf) {
+        self.folder_pdfs.clear();
+        self.pdf_thumbnails.clear();
+        self.selected_pdf_index = None;
+
+        if let Ok(entries) = std::fs::read_dir(folder_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("pdf")) {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    self.folder_pdfs.push(FolderPdfEntry { path, name });
+                }
+            }
+        }
+
+        // 名前でソート
+        self.folder_pdfs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.pdf_thumbnails.resize(self.folder_pdfs.len(), None);
+    }
+
     /// PDFを保存
     pub fn save_pdf(&mut self, path: &PathBuf) {
         if let Some(ref mut doc) = self.current_document {
-            // スタンプとテキスト注釈を適用
             for stamp in &self.stamps {
                 if let Err(e) = PdfOperations::add_stamp(doc, stamp) {
                     log::error!("スタンプ追加エラー: {}", e);
@@ -244,85 +278,230 @@ impl eframe::App for PdfViewerApp {
 
         // 左パネル: ファイルエクスプローラー
         egui::SidePanel::left("file_explorer")
-            .default_width(250.0)
+            .default_width(220.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("ファイル");
                 ui.separator();
-                if let Some(path) = self.file_explorer.show(ui) {
-                    if path.extension().map_or(false, |ext| ext == "pdf") {
+                if let Some((path, is_folder)) = self.file_explorer.show(ui) {
+                    if is_folder {
+                        // フォルダが選択された場合、PDFサムネイル一覧を更新
+                        self.update_folder_pdfs(&path);
+                    } else if path.extension().map_or(false, |ext| ext == "pdf") {
                         self.open_pdf(path);
                     }
                 }
             });
 
-        // 右パネル: サムネイル
-        egui::SidePanel::right("thumbnail_panel")
-            .default_width(200.0)
+        // 右パネル: プレビュー (大きく表示)
+        egui::SidePanel::right("preview_panel")
+            .default_width(450.0)
+            .min_width(300.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("ページ一覧");
+                ui.heading("プレビュー");
                 ui.separator();
 
-                if let Some(ref mut doc) = self.current_document {
-                    let result = self.thumbnail_panel.show(ui, doc, self.selected_page);
-
-                    if let Some(new_selection) = result.selected_page {
-                        self.selected_page = new_selection;
-                    }
-
-                    if let Some((from, to)) = result.page_reorder {
-                        if let Err(e) = PdfOperations::reorder_page(doc, from, to) {
-                            self.status_message = format!("ページ移動エラー: {}", e);
-                        } else {
-                            self.thumbnail_panel.load_thumbnails(doc);
+                if let Some(ref doc) = self.current_document {
+                    // ツールバー
+                    ui.horizontal(|ui| {
+                        if ui.button("◀").clicked() && self.selected_page > 0 {
+                            self.selected_page -= 1;
+                            self.editor_panel.invalidate_cache();
                         }
+                        ui.label(format!("{} / {}", self.selected_page + 1, doc.page_count()));
+                        if ui.button("▶").clicked() && self.selected_page < doc.page_count() - 1 {
+                            self.selected_page += 1;
+                            self.editor_panel.invalidate_cache();
+                        }
+
+                        ui.separator();
+
+                        // スタンプボタン
+                        if ui.selectable_label(self.show_stamp_panel, "✅ 承認").clicked() {
+                            self.show_stamp_panel = !self.show_stamp_panel;
+                            self.show_text_panel = false;
+                        }
+                        if ui.selectable_label(self.show_text_panel, "📝 テキスト").clicked() {
+                            self.show_text_panel = !self.show_text_panel;
+                            self.show_stamp_panel = false;
+                        }
+                    });
+
+                    ui.separator();
+
+                    // プレビュー表示
+                    let editor_result = self.editor_panel.show(
+                        ui,
+                        doc,
+                        self.selected_page,
+                        &self.stamps,
+                        &self.text_annotations,
+                        self.show_stamp_panel,
+                        self.show_text_panel,
+                    );
+
+                    if let Some(stamp) = editor_result.new_stamp {
+                        self.stamps.push(stamp);
+                    }
+                    if let Some(annotation) = editor_result.new_text {
+                        self.text_annotations.push(annotation);
                     }
 
-                    if let Some(page_to_delete) = result.page_deleted {
-                        if let Err(e) = PdfOperations::delete_page(doc, page_to_delete) {
-                            self.status_message = format!("ページ削除エラー: {}", e);
-                        } else {
-                            self.thumbnail_panel.load_thumbnails(doc);
-                            if self.selected_page >= doc.page_count() {
-                                self.selected_page = doc.page_count().saturating_sub(1);
-                            }
-                        }
-                    }
-
-                    if let Some((page, rotation)) = result.page_rotated {
-                        if let Err(e) = PdfOperations::rotate_page(doc, page, rotation) {
-                            self.status_message = format!("ページ回転エラー: {}", e);
-                        } else {
-                            self.thumbnail_panel.load_thumbnails(doc);
-                        }
-                    }
+                    // ページサムネイル (下部)
+                    ui.separator();
+                    ui.label("ページ一覧");
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let result = self.thumbnail_panel.show_horizontal(ui, doc, self.selected_page);
+                                if let Some(page) = result.selected_page {
+                                    self.selected_page = page;
+                                    self.editor_panel.invalidate_cache();
+                                }
+                            });
+                        });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("PDFファイルを選択してください");
+                    });
                 }
             });
 
-        // 中央パネル: メイン編集エリア
+        // 中央パネル: フォルダ内PDFサムネイル一覧
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(ref doc) = self.current_document {
-                let editor_result = self.editor_panel.show(
-                    ui,
-                    doc,
-                    self.selected_page,
-                    &self.stamps,
-                    &self.text_annotations,
-                    self.show_stamp_panel,
-                    self.show_text_panel,
-                );
-
-                if let Some(stamp) = editor_result.new_stamp {
-                    self.stamps.push(stamp);
-                }
-                if let Some(annotation) = editor_result.new_text {
-                    self.text_annotations.push(annotation);
-                }
-            } else {
+            if self.folder_pdfs.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("PDFファイルを開いてください");
+                    ui.label("左側のフォルダを選択すると、PDFファイルが表示されます");
                 });
+            } else {
+                ui.heading(format!("PDFファイル ({} 件)", self.folder_pdfs.len()));
+                ui.separator();
+
+                // サムネイルデータを事前にコピー
+                let folder_pdfs: Vec<(usize, PathBuf, String, bool, Option<egui::TextureId>)> = self
+                    .folder_pdfs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, entry)| {
+                        let tex_id = self.pdf_thumbnails.get(idx).and_then(|t| t.as_ref().map(|t| t.id()));
+                        (idx, entry.path.clone(), entry.name.clone(), self.selected_pdf_index == Some(idx), tex_id)
+                    })
+                    .collect();
+
+                let mut clicked_pdf: Option<(usize, PathBuf)> = None;
+                let mut thumbnails_to_load: Vec<(usize, PathBuf)> = Vec::new();
+
+                egui::ScrollArea::both()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        let available_width = ui.available_width();
+                        let thumb_width = 180.0;
+                        let thumb_height = 240.0;
+                        let spacing = 10.0;
+                        let columns = ((available_width - spacing) / (thumb_width + spacing)).floor() as usize;
+                        let columns = columns.max(1);
+
+                        egui::Grid::new("pdf_grid")
+                            .num_columns(columns)
+                            .spacing([spacing, spacing])
+                            .show(ui, |ui| {
+                                for (idx, path, name, is_selected, tex_id) in &folder_pdfs {
+                                    egui::Frame::none()
+                                        .fill(if *is_selected {
+                                            Color32::from_rgb(70, 130, 180)
+                                        } else {
+                                            Color32::from_gray(45)
+                                        })
+                                        .stroke(egui::Stroke::new(
+                                            if *is_selected { 3.0 } else { 1.0 },
+                                            if *is_selected {
+                                                Color32::from_rgb(100, 149, 237)
+                                            } else {
+                                                Color32::from_gray(60)
+                                            },
+                                        ))
+                                        .rounding(4.0)
+                                        .inner_margin(8.0)
+                                        .show(ui, |ui: &mut egui::Ui| {
+                                            ui.set_width(thumb_width);
+                                            ui.set_height(thumb_height);
+
+                                            ui.vertical_centered(|ui| {
+                                                // サムネイル表示エリア
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    Vec2::new(thumb_width - 16.0, thumb_height - 50.0),
+                                                    egui::Sense::click(),
+                                                );
+
+                                                // サムネイルを描画
+                                                if let Some(texture_id) = tex_id {
+                                                    ui.painter().image(
+                                                        *texture_id,
+                                                        rect,
+                                                        egui::Rect::from_min_max(
+                                                            egui::pos2(0.0, 0.0),
+                                                            egui::pos2(1.0, 1.0),
+                                                        ),
+                                                        Color32::WHITE,
+                                                    );
+                                                } else {
+                                                    // サムネイル生成予約
+                                                    ui.painter().rect_filled(rect, 2.0, Color32::from_gray(60));
+                                                    ui.painter().text(
+                                                        rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        "PDF",
+                                                        egui::FontId::proportional(24.0),
+                                                        Color32::from_gray(120),
+                                                    );
+                                                    thumbnails_to_load.push((*idx, path.clone()));
+                                                }
+
+                                                // クリックでPDFを開く
+                                                if response.clicked() {
+                                                    clicked_pdf = Some((*idx, path.clone()));
+                                                }
+
+                                                // ファイル名
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    egui::RichText::new(name)
+                                                        .size(11.0)
+                                                        .color(Color32::WHITE),
+                                                );
+                                            });
+                                        });
+
+                                    if (idx + 1) % columns == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    });
+
+                // サムネイル生成（最初の数個のみ）
+                for (idx, path) in thumbnails_to_load.into_iter().take(3) {
+                    if let Ok(doc) = PdfDocument::open(&path) {
+                        if let Some(image) = doc.render_page_thumbnail(0, 160, 200) {
+                            let texture = ctx.load_texture(
+                                format!("folder_pdf_{}", idx),
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            if idx < self.pdf_thumbnails.len() {
+                                self.pdf_thumbnails[idx] = Some(texture);
+                            }
+                        }
+                    }
+                }
+
+                // クリック処理
+                if let Some((idx, path)) = clicked_pdf {
+                    self.selected_pdf_index = Some(idx);
+                    self.open_pdf(path);
+                }
             }
         });
 
