@@ -1,6 +1,6 @@
 //! メイン編集パネル - PDF表示、スタンプ配置、テキスト入力
 
-use crate::pdf::{PdfDocument, Stamp, StampType, TextAnnotation};
+use crate::pdf::{CustomStampInfo, PdfDocument, Stamp, StampType, TextAnnotation};
 use eframe::egui::{self, Color32, TextureHandle, Vec2};
 
 /// エディター操作の結果
@@ -41,6 +41,9 @@ pub struct EditorPanel {
     // スタンプテクスチャキャッシュ
     #[allow(dead_code)]
     stamp_textures: Vec<Option<TextureHandle>>,
+    
+    // カスタムスタンプテクスチャ
+    custom_stamp_textures: Vec<Option<TextureHandle>>,
 }
 
 impl EditorPanel {
@@ -56,6 +59,7 @@ impl EditorPanel {
             text_font_size: 14.0,
             placing_text: false,
             stamp_textures: vec![None; 4],
+            custom_stamp_textures: Vec::new(),
         }
     }
 
@@ -69,6 +73,30 @@ impl EditorPanel {
         text_annotations: &[TextAnnotation],
         show_stamp_panel: bool,
         show_text_panel: bool,
+    ) -> EditorResult {
+        self.show_with_custom_stamps(
+            ui,
+            doc,
+            page_index,
+            stamps,
+            text_annotations,
+            show_stamp_panel,
+            show_text_panel,
+            &[],
+        )
+    }
+
+    /// カスタムスタンプ付きでUIを描画
+    pub fn show_with_custom_stamps(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &PdfDocument,
+        page_index: usize,
+        stamps: &[Stamp],
+        text_annotations: &[TextAnnotation],
+        show_stamp_panel: bool,
+        show_text_panel: bool,
+        custom_stamps: &[CustomStampInfo],
     ) -> EditorResult {
         let mut result = EditorResult::default();
 
@@ -116,6 +144,8 @@ impl EditorPanel {
                         ui.heading("スタンプ");
                         ui.separator();
 
+                        // 組み込みスタンプ
+                        ui.label("組み込み:");
                         let stamp_types = [
                             (StampType::Approved, "✅ 承認"),
                             (StampType::Rejected, "❌ 却下"),
@@ -126,7 +156,21 @@ impl EditorPanel {
                         for (stamp_type, label) in &stamp_types {
                             let selected = self.selected_stamp_type == *stamp_type;
                             if ui.selectable_label(selected, *label).clicked() {
-                                self.selected_stamp_type = *stamp_type;
+                                self.selected_stamp_type = stamp_type.clone();
+                            }
+                        }
+
+                        // カスタムスタンプ
+                        if !custom_stamps.is_empty() {
+                            ui.separator();
+                            ui.label("カスタム:");
+                            
+                            for custom in custom_stamps {
+                                let custom_type = StampType::Custom(custom.name.clone());
+                                let selected = self.selected_stamp_type == custom_type;
+                                if ui.selectable_label(selected, format!("🖼 {}", custom.name)).clicked() {
+                                    self.selected_stamp_type = custom_type;
+                                }
                             }
                         }
 
@@ -239,30 +283,41 @@ impl EditorPanel {
                                         egui::Rect::from_min_size(stamp_pos, stamp_size);
 
                                     // スタンプ背景
+                                    let bg_color = match &stamp.stamp_type {
+                                        StampType::Approved => Color32::from_rgba_unmultiplied(200, 255, 200, 180),
+                                        StampType::Rejected => Color32::from_rgba_unmultiplied(255, 200, 200, 180),
+                                        StampType::Draft => Color32::from_rgba_unmultiplied(255, 255, 200, 180),
+                                        StampType::Confidential => Color32::from_rgba_unmultiplied(200, 200, 255, 180),
+                                        StampType::Custom(_) => Color32::from_rgba_unmultiplied(220, 220, 220, 180),
+                                    };
+                                    
+                                    let border_color = match &stamp.stamp_type {
+                                        StampType::Approved => Color32::GREEN,
+                                        StampType::Rejected => Color32::RED,
+                                        StampType::Draft => Color32::from_rgb(200, 150, 0),
+                                        StampType::Confidential => Color32::BLUE,
+                                        StampType::Custom(_) => Color32::GRAY,
+                                    };
+
                                     ui.painter().rect_filled(
                                         stamp_rect,
                                         4.0,
-                                        Color32::from_rgba_unmultiplied(255, 200, 200, 180),
+                                        bg_color,
                                     );
                                     ui.painter().rect_stroke(
                                         stamp_rect,
                                         4.0,
-                                        egui::Stroke::new(2.0, Color32::RED),
+                                        egui::Stroke::new(2.0, border_color),
                                     );
 
                                     // スタンプテキスト
-                                    let stamp_label = match stamp.stamp_type {
-                                        StampType::Approved => "承認",
-                                        StampType::Rejected => "却下",
-                                        StampType::Draft => "下書き",
-                                        StampType::Confidential => "機密",
-                                    };
+                                    let stamp_label = stamp.stamp_type.label();
                                     ui.painter().text(
                                         stamp_rect.center(),
                                         egui::Align2::CENTER_CENTER,
                                         stamp_label,
                                         egui::FontId::proportional(16.0 * self.zoom),
-                                        Color32::RED,
+                                        border_color,
                                     );
                                 }
 
@@ -295,7 +350,7 @@ impl EditorPanel {
                                             y: pdf_y,
                                             width: 100.0,
                                             height: 50.0,
-                                            stamp_type: self.selected_stamp_type,
+                                            stamp_type: self.selected_stamp_type.clone(),
                                         });
                                         self.placing_stamp = false;
                                     }

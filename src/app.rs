@@ -26,6 +26,7 @@ pub struct PdfViewerApp {
     show_split_dialog: bool,
     show_stamp_panel: bool,
     show_text_panel: bool,
+    show_stamp_register_dialog: bool,
     split_start_page: String,
     split_end_page: String,
 
@@ -33,6 +34,13 @@ pub struct PdfViewerApp {
     folder_pdfs: Vec<FolderPdfEntry>,
     selected_pdf_index: Option<usize>,
     pdf_thumbnails: Vec<Option<TextureHandle>>,
+
+    // カスタムスタンプ
+    custom_stamps: Vec<CustomStamp>,
+    stamp_textures: Vec<Option<TextureHandle>>,
+
+    // プレビューパネルのサイズ比率
+    preview_split_ratio: f32,
 
     // ステータスメッセージ
     status_message: String,
@@ -42,6 +50,14 @@ pub struct PdfViewerApp {
 struct FolderPdfEntry {
     path: PathBuf,
     name: String,
+}
+
+/// カスタムスタンプ
+#[derive(Clone)]
+pub struct CustomStamp {
+    pub name: String,
+    pub path: PathBuf,
+    pub image_data: Vec<u8>,
 }
 
 impl PdfViewerApp {
@@ -59,11 +75,15 @@ impl PdfViewerApp {
             show_split_dialog: false,
             show_stamp_panel: false,
             show_text_panel: false,
+            show_stamp_register_dialog: false,
             split_start_page: String::new(),
             split_end_page: String::new(),
             folder_pdfs: Vec::new(),
             selected_pdf_index: None,
             pdf_thumbnails: Vec::new(),
+            custom_stamps: Vec::new(),
+            stamp_textures: Vec::new(),
+            preview_split_ratio: 0.7,
             status_message: "準備完了".to_string(),
         }
     }
@@ -180,6 +200,110 @@ impl PdfViewerApp {
             }
         }
     }
+
+    /// ページを回転
+    fn rotate_page(&mut self, page: usize, angle: i32) {
+        if let Some(ref mut doc) = self.current_document {
+            if let Err(e) = PdfOperations::rotate_page(doc, page, angle) {
+                self.status_message = format!("回転エラー: {}", e);
+            } else {
+                self.status_message = format!("ページ {} を {}° 回転しました", page + 1, angle);
+                self.editor_panel.invalidate_cache();
+                self.thumbnail_panel.load_thumbnails(doc);
+            }
+        }
+    }
+
+    /// ファイル操作を実行
+    fn handle_file_operations(&mut self, 
+        file_moved: Option<(PathBuf, PathBuf)>,
+        file_copied: Option<(PathBuf, PathBuf)>,
+        file_deleted: Option<PathBuf>
+    ) {
+        // ファイル移動
+        if let Some((src, dest)) = file_moved {
+            match std::fs::rename(&src, &dest) {
+                Ok(_) => {
+                    self.status_message = format!("移動しました: {} → {}", src.display(), dest.display());
+                }
+                Err(e) => {
+                    self.status_message = format!("移動エラー: {}", e);
+                }
+            }
+        }
+
+        // ファイルコピー
+        if let Some((src, dest)) = file_copied {
+            if src.is_dir() {
+                match copy_dir_all(&src, &dest) {
+                    Ok(_) => {
+                        self.status_message = format!("コピーしました: {} → {}", src.display(), dest.display());
+                    }
+                    Err(e) => {
+                        self.status_message = format!("コピーエラー: {}", e);
+                    }
+                }
+            } else {
+                match std::fs::copy(&src, &dest) {
+                    Ok(_) => {
+                        self.status_message = format!("コピーしました: {} → {}", src.display(), dest.display());
+                    }
+                    Err(e) => {
+                        self.status_message = format!("コピーエラー: {}", e);
+                    }
+                }
+            }
+        }
+
+        // ファイル削除
+        if let Some(path) = file_deleted {
+            let result = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+
+            match result {
+                Ok(_) => {
+                    self.status_message = format!("削除しました: {}", path.display());
+                }
+                Err(e) => {
+                    self.status_message = format!("削除エラー: {}", e);
+                }
+            }
+        }
+    }
+
+    /// カスタムスタンプを登録
+    fn register_custom_stamp(&mut self, path: PathBuf) {
+        if let Ok(data) = std::fs::read(&path) {
+            let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            self.custom_stamps.push(CustomStamp {
+                name,
+                path: path.clone(),
+                image_data: data,
+            });
+            self.stamp_textures.push(None);
+            self.status_message = format!("スタンプを登録しました: {}", path.display());
+        } else {
+            self.status_message = format!("スタンプの読み込みに失敗しました: {}", path.display());
+        }
+    }
+}
+
+/// ディレクトリを再帰的にコピー
+fn copy_dir_all(src: &PathBuf, dest: &PathBuf) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dest.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 impl eframe::App for PdfViewerApp {
@@ -188,7 +312,7 @@ impl eframe::App for PdfViewerApp {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("ファイル", |ui| {
-                    if ui.button("開く...").clicked() {
+                    if ui.button("📂 開く...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PDF", &["pdf"])
                             .pick_file()
@@ -197,7 +321,7 @@ impl eframe::App for PdfViewerApp {
                         }
                         ui.close_menu();
                     }
-                    if ui.button("保存...").clicked() {
+                    if ui.button("💾 保存...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PDF", &["pdf"])
                             .set_file_name("output.pdf")
@@ -208,7 +332,7 @@ impl eframe::App for PdfViewerApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("結合用PDFを追加...").clicked() {
+                    if ui.button("➕ 結合用PDFを追加...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PDF", &["pdf"])
                             .pick_file()
@@ -221,38 +345,56 @@ impl eframe::App for PdfViewerApp {
                         }
                         ui.close_menu();
                     }
-                    if ui.button("PDFを結合").clicked() {
+                    if ui.button("🔗 PDFを結合").clicked() {
                         self.merge_pdfs();
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("分割...").clicked() {
+                    if ui.button("✂ 分割...").clicked() {
                         self.show_split_dialog = true;
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("終了").clicked() {
+                    if ui.button("❌ 終了").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
 
                 ui.menu_button("編集", |ui| {
-                    if ui.button("スタンプを追加").clicked() {
+                    if ui.button("🔄 90°回転").clicked() {
+                        self.rotate_page(self.selected_page, 90);
+                        ui.close_menu();
+                    }
+                    if ui.button("🔄 180°回転").clicked() {
+                        self.rotate_page(self.selected_page, 180);
+                        ui.close_menu();
+                    }
+                    if ui.button("🔄 270°回転").clicked() {
+                        self.rotate_page(self.selected_page, 270);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("✅ スタンプパネル").clicked() {
                         self.show_stamp_panel = !self.show_stamp_panel;
                         ui.close_menu();
                     }
-                    if ui.button("テキストを追加").clicked() {
+                    if ui.button("📝 テキストパネル").clicked() {
                         self.show_text_panel = !self.show_text_panel;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("🖼 スタンプを登録...").clicked() {
+                        self.show_stamp_register_dialog = true;
                         ui.close_menu();
                     }
                 });
 
                 ui.menu_button("表示", |ui| {
-                    if ui.button("ダークモード").clicked() {
+                    if ui.button("🌙 ダークモード").clicked() {
                         ctx.set_visuals(egui::Visuals::dark());
                         ui.close_menu();
                     }
-                    if ui.button("ライトモード").clicked() {
+                    if ui.button("☀ ライトモード").clicked() {
                         ctx.set_visuals(egui::Visuals::light());
                         ui.close_menu();
                     }
@@ -272,96 +414,191 @@ impl eframe::App for PdfViewerApp {
                             doc.page_count()
                         ));
                     }
+                    if !self.custom_stamps.is_empty() {
+                        ui.label(format!("| カスタムスタンプ: {} 個", self.custom_stamps.len()));
+                    }
                 });
             });
         });
 
-        // 左パネル: ファイルエクスプローラー
+        // 左パネル: ファイルエクスプローラー（ツリー表示）
         egui::SidePanel::left("file_explorer")
-            .default_width(220.0)
+            .default_width(250.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("ファイル");
+                ui.heading("📁 ファイル");
                 ui.separator();
-                if let Some((path, is_folder)) = self.file_explorer.show(ui) {
-                    if is_folder {
-                        // フォルダが選択された場合、PDFサムネイル一覧を更新
-                        self.update_folder_pdfs(&path);
-                    } else if path.extension().map_or(false, |ext| ext == "pdf") {
-                        self.open_pdf(path);
-                    }
+                let file_result = self.file_explorer.show(ui);
+                
+                // フォルダが選択された場合
+                if let Some(folder_path) = file_result.selected_folder {
+                    self.update_folder_pdfs(&folder_path);
                 }
+                
+                // PDFファイルが選択された場合
+                if let Some(file_path) = file_result.selected_file {
+                    self.open_pdf(file_path);
+                }
+                
+                // ファイル操作
+                self.handle_file_operations(
+                    file_result.file_moved,
+                    file_result.file_copied,
+                    file_result.file_deleted
+                );
             });
 
-        // 右パネル: プレビュー (大きく表示)
+        // 右パネル: プレビュー (リサイズ可能な上下分割)
+        // 事前に必要な情報を取得
+        let has_document = self.current_document.is_some();
+        let page_count = self.current_document.as_ref().map(|d| d.page_count()).unwrap_or(0);
+        
         egui::SidePanel::right("preview_panel")
-            .default_width(450.0)
+            .default_width(500.0)
             .min_width(300.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("プレビュー");
+                ui.heading("📄 プレビュー");
                 ui.separator();
 
-                if let Some(ref doc) = self.current_document {
-                    // ツールバー
+                if has_document {
+                    let available_height = ui.available_height();
+                    let preview_height = available_height * self.preview_split_ratio;
+                    let thumbnail_height = available_height * (1.0 - self.preview_split_ratio);
+
+                    // ツールバー（借用問題を避けるため、先に処理）
+                    let mut prev_clicked = false;
+                    let mut next_clicked = false;
+                    let mut rotate_clicked = false;
+                    let mut stamp_toggled = false;
+                    let mut text_toggled = false;
+                    
                     ui.horizontal(|ui| {
-                        if ui.button("◀").clicked() && self.selected_page > 0 {
-                            self.selected_page -= 1;
-                            self.editor_panel.invalidate_cache();
-                        }
-                        ui.label(format!("{} / {}", self.selected_page + 1, doc.page_count()));
-                        if ui.button("▶").clicked() && self.selected_page < doc.page_count() - 1 {
-                            self.selected_page += 1;
-                            self.editor_panel.invalidate_cache();
-                        }
+                        prev_clicked = ui.button("◀").clicked() && self.selected_page > 0;
+                        ui.label(format!("{} / {}", self.selected_page + 1, page_count));
+                        next_clicked = ui.button("▶").clicked() && self.selected_page < page_count - 1;
+
+                        ui.separator();
+
+                        // 回転ボタン
+                        rotate_clicked = ui.button("🔄").on_hover_text("90°回転").clicked();
 
                         ui.separator();
 
                         // スタンプボタン
-                        if ui.selectable_label(self.show_stamp_panel, "✅ 承認").clicked() {
-                            self.show_stamp_panel = !self.show_stamp_panel;
-                            self.show_text_panel = false;
-                        }
-                        if ui.selectable_label(self.show_text_panel, "📝 テキスト").clicked() {
-                            self.show_text_panel = !self.show_text_panel;
-                            self.show_stamp_panel = false;
-                        }
+                        stamp_toggled = ui.selectable_label(self.show_stamp_panel, "✅").on_hover_text("スタンプ").clicked();
+                        text_toggled = ui.selectable_label(self.show_text_panel, "📝").on_hover_text("テキスト").clicked();
                     });
+
+                    // ツールバーの結果を適用
+                    if prev_clicked {
+                        self.selected_page -= 1;
+                        self.editor_panel.invalidate_cache();
+                    }
+                    if next_clicked {
+                        self.selected_page += 1;
+                        self.editor_panel.invalidate_cache();
+                    }
+                    if rotate_clicked {
+                        let page = self.selected_page;
+                        self.rotate_page(page, 90);
+                    }
+                    if stamp_toggled {
+                        self.show_stamp_panel = !self.show_stamp_panel;
+                        self.show_text_panel = false;
+                    }
+                    if text_toggled {
+                        self.show_text_panel = !self.show_text_panel;
+                        self.show_stamp_panel = false;
+                    }
 
                     ui.separator();
 
-                    // プレビュー表示
-                    let editor_result = self.editor_panel.show(
-                        ui,
-                        doc,
-                        self.selected_page,
-                        &self.stamps,
-                        &self.text_annotations,
-                        self.show_stamp_panel,
-                        self.show_text_panel,
+                    // 上部: プレビュー
+                    let mut new_stamp = None;
+                    let mut new_text = None;
+                    
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), preview_height - 60.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            if let Some(ref doc) = self.current_document {
+                                let editor_result = self.editor_panel.show(
+                                    ui,
+                                    doc,
+                                    self.selected_page,
+                                    &self.stamps,
+                                    &self.text_annotations,
+                                    self.show_stamp_panel,
+                                    self.show_text_panel,
+                                );
+                                new_stamp = editor_result.new_stamp;
+                                new_text = editor_result.new_text;
+                            }
+                        }
                     );
 
-                    if let Some(stamp) = editor_result.new_stamp {
+                    if let Some(stamp) = new_stamp {
                         self.stamps.push(stamp);
                     }
-                    if let Some(annotation) = editor_result.new_text {
+                    if let Some(annotation) = new_text {
                         self.text_annotations.push(annotation);
                     }
 
-                    // ページサムネイル (下部)
+                    // リサイズハンドル
                     ui.separator();
-                    ui.label("ページ一覧");
-                    egui::ScrollArea::horizontal()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let result = self.thumbnail_panel.show_horizontal(ui, doc, self.selected_page);
-                                if let Some(page) = result.selected_page {
-                                    self.selected_page = page;
-                                    self.editor_panel.invalidate_cache();
-                                }
-                            });
-                        });
+                    let resize_response = ui.allocate_response(
+                        Vec2::new(ui.available_width(), 8.0),
+                        egui::Sense::drag()
+                    );
+                    
+                    if resize_response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    
+                    if resize_response.dragged() {
+                        let delta = resize_response.drag_delta().y / available_height;
+                        self.preview_split_ratio = (self.preview_split_ratio + delta).clamp(0.3, 0.9);
+                    }
+                    
+                    // リサイズハンドルの描画
+                    ui.painter().rect_filled(
+                        resize_response.rect,
+                        2.0,
+                        if resize_response.hovered() { Color32::from_gray(100) } else { Color32::from_gray(60) }
+                    );
+
+                    // 下部: ページサムネイル
+                    let mut selected_page_from_thumb = None;
+                    let mut rotate_from_thumb = None;
+                    
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), thumbnail_height - 20.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.label("ページ一覧");
+                            egui::ScrollArea::horizontal()
+                                .auto_shrink([false; 2])
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if let Some(ref doc) = self.current_document {
+                                            let result = self.thumbnail_panel.show_horizontal(ui, doc, self.selected_page);
+                                            selected_page_from_thumb = result.selected_page;
+                                            rotate_from_thumb = result.page_rotated;
+                                        }
+                                    });
+                                });
+                        }
+                    );
+
+                    // サムネイル操作の結果を適用
+                    if let Some(page) = selected_page_from_thumb {
+                        self.selected_page = page;
+                        self.editor_panel.invalidate_cache();
+                    }
+                    if let Some((page, angle)) = rotate_from_thumb {
+                        self.rotate_page(page, angle);
+                    }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label("PDFファイルを選択してください");
@@ -376,7 +613,7 @@ impl eframe::App for PdfViewerApp {
                     ui.label("左側のフォルダを選択すると、PDFファイルが表示されます");
                 });
             } else {
-                ui.heading(format!("PDFファイル ({} 件)", self.folder_pdfs.len()));
+                ui.heading(format!("📚 PDFファイル ({} 件)", self.folder_pdfs.len()));
                 ui.separator();
 
                 // サムネイルデータを事前にコピー
@@ -507,10 +744,15 @@ impl eframe::App for PdfViewerApp {
 
         // 分割ダイアログ
         if self.show_split_dialog {
-            egui::Window::new("PDF分割")
+            egui::Window::new("✂ PDF分割")
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
+                    if let Some(ref doc) = self.current_document {
+                        ui.label(format!("総ページ数: {}", doc.page_count()));
+                        ui.separator();
+                    }
+                    
                     ui.horizontal(|ui| {
                         ui.label("開始ページ:");
                         ui.text_edit_singleline(&mut self.split_start_page);
@@ -519,6 +761,7 @@ impl eframe::App for PdfViewerApp {
                         ui.label("終了ページ:");
                         ui.text_edit_singleline(&mut self.split_end_page);
                     });
+                    ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("分割").clicked() {
                             self.split_pdf();
@@ -526,6 +769,54 @@ impl eframe::App for PdfViewerApp {
                         }
                         if ui.button("キャンセル").clicked() {
                             self.show_split_dialog = false;
+                        }
+                    });
+                });
+        }
+
+        // スタンプ登録ダイアログ
+        if self.show_stamp_register_dialog {
+            egui::Window::new("🖼 カスタムスタンプ登録")
+                .collapsible(false)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.label("PNG画像ファイルを選択して、カスタムスタンプとして登録できます。");
+                    ui.separator();
+                    
+                    // 既存のカスタムスタンプ一覧
+                    if !self.custom_stamps.is_empty() {
+                        ui.label(format!("登録済みスタンプ: {} 個", self.custom_stamps.len()));
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                let stamps_to_show: Vec<_> = self.custom_stamps.iter().enumerate()
+                                    .map(|(i, s)| (i, s.name.clone()))
+                                    .collect();
+                                
+                                for (idx, name) in stamps_to_show {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("• {}", name));
+                                        if ui.small_button("🗑").clicked() {
+                                            // 削除予約（後で処理）
+                                        }
+                                    });
+                                }
+                            });
+                        ui.separator();
+                    }
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("📂 PNG画像を追加...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PNG", &["png"])
+                                .pick_file()
+                            {
+                                self.register_custom_stamp(path);
+                            }
+                        }
+                        
+                        if ui.button("閉じる").clicked() {
+                            self.show_stamp_register_dialog = false;
                         }
                     });
                 });
