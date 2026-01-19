@@ -462,9 +462,12 @@ impl eframe::App for PdfViewerApp {
                 ui.separator();
 
                 if has_document {
-                    let available_height = ui.available_height();
-                    let preview_height = available_height * self.preview_split_ratio;
-                    let thumbnail_height = available_height * (1.0 - self.preview_split_ratio);
+                    let total_height = ui.available_height();
+                    let toolbar_height = 50.0; // ツールバー分
+                    let resize_bar_height = 20.0; // リサイズバー分
+                    let content_height = total_height - toolbar_height - resize_bar_height;
+                    let preview_height = content_height * self.preview_split_ratio;
+                    let thumbnail_height = content_height * (1.0 - self.preview_split_ratio);
 
                     // ツールバー（借用問題を避けるため、先に処理）
                     let mut prev_clicked = false;
@@ -519,7 +522,7 @@ impl eframe::App for PdfViewerApp {
                     let mut new_text = None;
                     
                     ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), preview_height - 60.0),
+                        Vec2::new(ui.available_width(), preview_height.max(100.0)),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             if let Some(ref doc) = self.current_document {
@@ -545,35 +548,64 @@ impl eframe::App for PdfViewerApp {
                         self.text_annotations.push(annotation);
                     }
 
-                    // リサイズハンドル
-                    ui.separator();
-                    let resize_response = ui.allocate_response(
-                        Vec2::new(ui.available_width(), 8.0),
-                        egui::Sense::drag()
+                    // リサイズハンドル（より大きく、見やすく）
+                    ui.add_space(4.0);
+                    
+                    let resize_height = 12.0;
+                    let (resize_rect, resize_response) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), resize_height),
+                        egui::Sense::click_and_drag()
                     );
                     
-                    if resize_response.hovered() {
+                    // ドラッグ処理
+                    if resize_response.dragged() {
+                        let delta = resize_response.drag_delta().y / content_height;
+                        self.preview_split_ratio = (self.preview_split_ratio + delta).clamp(0.2, 0.85);
+                    }
+                    
+                    // カーソル変更
+                    if resize_response.hovered() || resize_response.dragged() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                     }
                     
-                    if resize_response.dragged() {
-                        let delta = resize_response.drag_delta().y / available_height;
-                        self.preview_split_ratio = (self.preview_split_ratio + delta).clamp(0.3, 0.9);
+                    // リサイズハンドルの描画（より目立つように）
+                    let handle_color = if resize_response.hovered() || resize_response.dragged() {
+                        Color32::from_rgb(100, 149, 237) // 青色でハイライト
+                    } else {
+                        Color32::from_gray(80)
+                    };
+                    
+                    // バーの背景
+                    ui.painter().rect_filled(
+                        resize_rect,
+                        4.0,
+                        handle_color,
+                    );
+                    
+                    // 中央のグリップ表示（3本線）
+                    let grip_width = 40.0;
+                    let grip_y = resize_rect.center().y;
+                    let grip_x_start = resize_rect.center().x - grip_width / 2.0;
+                    
+                    for i in 0..3 {
+                        let y_offset = (i as f32 - 1.0) * 3.0;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(grip_x_start, grip_y + y_offset),
+                                egui::pos2(grip_x_start + grip_width, grip_y + y_offset),
+                            ],
+                            egui::Stroke::new(1.5, Color32::from_gray(200)),
+                        );
                     }
                     
-                    // リサイズハンドルの描画
-                    ui.painter().rect_filled(
-                        resize_response.rect,
-                        2.0,
-                        if resize_response.hovered() { Color32::from_gray(100) } else { Color32::from_gray(60) }
-                    );
+                    ui.add_space(4.0);
 
                     // 下部: ページサムネイル
                     let mut selected_page_from_thumb = None;
                     let mut rotate_from_thumb = None;
                     
                     ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), thumbnail_height - 20.0),
+                        Vec2::new(ui.available_width(), thumbnail_height.max(80.0)),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             ui.label("ページ一覧");
